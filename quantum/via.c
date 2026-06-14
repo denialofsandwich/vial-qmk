@@ -42,6 +42,10 @@
 #include "vialrgb.h"
 #endif
 
+#ifdef VIA_QMK_RGB_MATRIX_ENABLE
+#include "rgb_matrix.h"
+#endif
+
 // Forward declare some helpers.
 #if defined(VIA_QMK_BACKLIGHT_ENABLE)
 void via_qmk_backlight_set_value(uint8_t *data);
@@ -602,16 +606,16 @@ void via_qmk_rgb_matrix_get_value(uint8_t *data) {
     uint8_t *value_id   = &(data[0]);
     uint8_t *value_data = &(data[1]);
     switch (*value_id) {
-        case id_qmk_rgblight_brightness:
+        case id_qmk_rgb_matrix_brightness:
             value_data[0] = rgb_matrix_get_val();
             break;
-        case id_qmk_rgblight_effect:
+        case id_qmk_rgb_matrix_effect:
             value_data[0] = rgb_matrix_get_mode();
             break;
-        case id_qmk_rgblight_effect_speed:
+        case id_qmk_rgb_matrix_effect_speed:
             value_data[0] = speed_to_rgblight(rgb_matrix_get_speed());
             break;
-        case id_qmk_rgblight_color:
+        case id_qmk_rgb_matrix_color:
             value_data[0] = rgb_matrix_get_hue();
             value_data[1] = rgb_matrix_get_sat();
             break;
@@ -623,10 +627,10 @@ void via_qmk_rgb_matrix_set_value(uint8_t *data) {
     uint8_t *value_data = &(data[1]);
     rgb_matrix_value_id_mask |= 0x01U << *value_id;
     switch (*value_id) {
-        case id_qmk_rgblight_brightness:
+        case id_qmk_rgb_matrix_brightness:
             rgb_matrix_sethsv_noeeprom(rgb_matrix_get_hue(), rgb_matrix_get_sat(), value_data[0]);
             break;
-        case id_qmk_rgblight_effect:
+        case id_qmk_rgb_matrix_effect:
             rgb_matrix_mode_noeeprom(value_data[0]);
             if (value_data[0] == 0) {
                 rgb_matrix_disable_noeeprom();
@@ -634,13 +638,12 @@ void via_qmk_rgb_matrix_set_value(uint8_t *data) {
                 rgb_matrix_enable_noeeprom();
             }
             break;
-        case id_qmk_rgblight_effect_speed:
+        case id_qmk_rgb_matrix_effect_speed:
             rgb_matrix_set_speed_noeeprom(speed_from_rgblight(value_data[0]));
             break;
-        case id_qmk_rgblight_color:
+        case id_qmk_rgb_matrix_color:
             rgb_matrix_sethsv_noeeprom(value_data[0], value_data[1], rgb_matrix_get_val());
             break;
-        }
     }
 }
 
