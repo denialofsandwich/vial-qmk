@@ -33,6 +33,7 @@ enum layers {
 enum custom_keycodes {
     M0 = SAFE_RANGE,
     RCTRL_LOOP,
+    LCLICK_LOOP,
 };
 
 #define FN1_MAC MO(MAC_FN1)
@@ -71,7 +72,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     [FN2] = LAYOUT_iso_68(
         KC_TILD,  KC_F1,    KC_F2,    KC_F3,    KC_F4,    KC_F5,    KC_F6,    KC_F7,    KC_F8,    KC_F9,    KC_F10,   KC_F11,   KC_F12,   _______,            _______,
         _______,  DM_REC1,  DM_REC2,  DM_RSTP,  _______,  _______,  _______,  _______,  _______,  _______,  M0, _______, _______,                      _______,
-        _______,  DM_PLY1,  DM_PLY2,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,            _______,
+        _______,  DM_PLY1,  DM_PLY2,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______, LCLICK_LOOP,            _______,
         _______,  _______,  _______,  _______,  _______,  _______,  BAT_LVL,  _______,  _______,  _______,  _______,  _______,            _______,  _______,
         RCTRL_LOOP, _______,  _______,                              _______,                                _______,  _______,  _______,  _______,  _______,  _______)
 };
@@ -86,7 +87,8 @@ const uint16_t PROGMEM encoder_map[][NUM_ENCODERS][2] = {
 };
 #endif // ENCODER_MAP_ENABLE
 
-static bool rctrl_loop_active = false;
+static bool rctrl_loop_active  = false;
+static bool lclick_loop_active = false;
 
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     switch (keycode) {
@@ -100,6 +102,11 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
                 rctrl_loop_active = !rctrl_loop_active;
             }
             return false;
+        case LCLICK_LOOP:
+            if (record->event.pressed) {
+                lclick_loop_active = !lclick_loop_active;
+            }
+            return false;
     }
     return true;
 }
@@ -108,12 +115,16 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
 extern uint8_t per_key_rgb_type;
 
 void matrix_scan_user(void) {
-    static bool     last_usb_state = false;
-    static bool     initialized    = false;
-    static uint32_t last_check     = 0;
-
-    if (timer_elapsed32(last_check) < 200) return;
-    last_check = timer_read32();
+    static uint32_t lclick_timer = 0;
+    if (lclick_loop_active) {
+        lpm_timer_reset();
+        if (timer_elapsed32(lclick_timer) >= 50) {
+            lclick_timer = timer_read32();
+            tap_code(KC_BTN1);
+        }
+    } else {
+        lclick_timer = timer_read32();
+    }
 
     static uint32_t rctrl_timer = 0;
     if (rctrl_loop_active) {
@@ -125,6 +136,13 @@ void matrix_scan_user(void) {
     } else {
         rctrl_timer = timer_read32();
     }
+
+    static bool     last_usb_state = false;
+    static bool     initialized    = false;
+    static uint32_t last_check     = 0;
+
+    if (timer_elapsed32(last_check) < 200) return;
+    last_check = timer_read32();
 
     // Use a full color effect using a wire and a low energy glow on battery
     bool usb_now = usb_power_connected();
@@ -143,6 +161,9 @@ void matrix_scan_user(void) {
 bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
     if (rctrl_loop_active && led_min <= 57 && 57 < led_max) {
         rgb_matrix_set_color(57, 0x00, 0xFF, 0x00);
+    }
+    if (lclick_loop_active && led_min <= 27 && 27 < led_max) {
+        rgb_matrix_set_color(27, 0x00, 0xFF, 0x00);
     }
     return false;
 }
