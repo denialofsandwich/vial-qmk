@@ -16,6 +16,7 @@
 
 #include QMK_KEYBOARD_H
 #include "keychron_common.h"
+#include "macros/main.h"
 #ifdef RGB_MATRIX_ENABLE
 #    include "lpm.h"
 #    include "keychron_rgb_type.h"
@@ -27,6 +28,10 @@ enum layers {
     MAC_FN1,
     WIN_FN1,
     FN2,
+};
+
+enum custom_keycodes {
+    M0 = SAFE_RANGE,
 };
 
 #define FN1_MAC MO(MAC_FN1)
@@ -64,7 +69,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
 
     [FN2] = LAYOUT_iso_68(
         KC_TILD,  KC_F1,    KC_F2,    KC_F3,    KC_F4,    KC_F5,    KC_F6,    KC_F7,    KC_F8,    KC_F9,    KC_F10,   KC_F11,   KC_F12,   _______,            _______,
-        _______,  DM_REC1,  DM_REC2,  DM_RSTP,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,                      _______,
+        _______,  DM_REC1,  DM_REC2,  DM_RSTP,  _______,  _______,  _______,  _______,  _______,  _______,  M0, _______, _______,                      _______,
         _______,  DM_PLY1,  DM_PLY2,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,            _______,
         _______,  _______,  _______,  _______,  _______,  _______,  BAT_LVL,  _______,  _______,  _______,  _______,  _______,            _______,  _______,
         _______,  _______,  _______,                                _______,                                _______,  _______,  _______,  _______,  _______,  _______)
@@ -79,6 +84,18 @@ const uint16_t PROGMEM encoder_map[][NUM_ENCODERS][2] = {
     [FN2]      = { ENCODER_CCW_CW(_______, _______) }
 };
 #endif // ENCODER_MAP_ENABLE
+
+bool process_record_user(uint16_t keycode, keyrecord_t *record) {
+    switch (keycode) {
+        case M0:
+            if (record->event.pressed) {
+                SEND_STRING(M0_SEQ);
+            }
+            return false;
+    }
+    return true;
+}
+
 #ifdef RGB_MATRIX_ENABLE
 extern uint8_t per_key_rgb_type;
 
