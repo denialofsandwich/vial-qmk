@@ -32,6 +32,7 @@ enum layers {
 
 enum custom_keycodes {
     M0 = SAFE_RANGE,
+    RCTRL_LOOP,
 };
 
 #define FN1_MAC MO(MAC_FN1)
@@ -72,7 +73,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
         _______,  DM_REC1,  DM_REC2,  DM_RSTP,  _______,  _______,  _______,  _______,  _______,  _______,  M0, _______, _______,                      _______,
         _______,  DM_PLY1,  DM_PLY2,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,            _______,
         _______,  _______,  _______,  _______,  _______,  _______,  BAT_LVL,  _______,  _______,  _______,  _______,  _______,            _______,  _______,
-        _______,  _______,  _______,                                _______,                                _______,  _______,  _______,  _______,  _______,  _______)
+        RCTRL_LOOP, _______,  _______,                              _______,                                _______,  _______,  _______,  _______,  _______,  _______)
 };
 
 #if defined(ENCODER_MAP_ENABLE)
@@ -85,11 +86,18 @@ const uint16_t PROGMEM encoder_map[][NUM_ENCODERS][2] = {
 };
 #endif // ENCODER_MAP_ENABLE
 
+static bool rctrl_loop_active = false;
+
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     switch (keycode) {
         case M0:
             if (record->event.pressed) {
                 SEND_STRING(M0_SEQ);
+            }
+            return false;
+        case RCTRL_LOOP:
+            if (record->event.pressed) {
+                rctrl_loop_active = !rctrl_loop_active;
             }
             return false;
     }
@@ -107,6 +115,17 @@ void matrix_scan_user(void) {
     if (timer_elapsed32(last_check) < 200) return;
     last_check = timer_read32();
 
+    static uint32_t rctrl_timer = 0;
+    if (rctrl_loop_active) {
+        lpm_timer_reset();
+        if (timer_elapsed32(rctrl_timer) >= 60000) {
+            rctrl_timer = timer_read32();
+            tap_code(KC_RCTL);
+        }
+    } else {
+        rctrl_timer = timer_read32();
+    }
+
     // Use a full color effect using a wire and a low energy glow on battery
     bool usb_now = usb_power_connected();
     if (!initialized || usb_now != last_usb_state) {
@@ -119,5 +138,12 @@ void matrix_scan_user(void) {
             rgb_matrix_mode_noeeprom(RGB_MATRIX_SOLID_REACTIVE_MULTIWIDE);
         }
     }
+}
+
+bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
+    if (rctrl_loop_active && led_min <= 57 && 57 < led_max) {
+        rgb_matrix_set_color(57, 0x00, 0xFF, 0x00);
+    }
+    return false;
 }
 #endif
