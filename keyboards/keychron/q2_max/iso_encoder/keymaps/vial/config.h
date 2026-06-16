@@ -6,3 +6,14 @@
 
 #define VIAL_UNLOCK_COMBO_ROWS { 0, 1 }
 #define VIAL_UNLOCK_COMBO_COLS { 0, 13 }
+
+#ifdef RGB_MATRIX_ENABLE
+#    define RGB_MATRIX_KEYREACTIVE_ENABLED
+#    define ENABLE_RGB_MATRIX_SOLID_REACTIVE_MULTIWIDE
+// Default effect: Solid Reactive Multiwide, color #26D4FF, brightness max, speed 20%
+#    define RGB_MATRIX_DEFAULT_MODE RGB_MATRIX_SOLID_REACTIVE_MULTIWIDE
+#    define RGB_MATRIX_DEFAULT_HUE  136
+#    define RGB_MATRIX_DEFAULT_SAT  217
+#    define RGB_MATRIX_DEFAULT_VAL  255
+#    define RGB_MATRIX_DEFAULT_SPD  51
+#endif

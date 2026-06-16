@@ -128,16 +128,20 @@ led_config_t g_led_config = {
 };
 
 // Default Color of Per Key RGB
-#define DC_RED {HSV_RED}
-#define DC_BLU {HSV_BLUE}
-#define DC_YLW {HSV_YELLOW}
+// Gradient #00ff44 (left, hue=96) to #0044ff (right, hue=159), hue = 96 + round(x * 63 / 224)
+#define GRAD(h) {h, 255, 255}
 
 HSV default_per_key_led[RGB_MATRIX_LED_COUNT] = {
-    DC_RED,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_YLW,
-    DC_YLW,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_RED,   DC_YLW,
-    DC_YLW,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_YLW,
-    DC_YLW,  DC_YLW,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,  DC_BLU,           DC_YLW,   DC_YLW,
-    DC_YLW,  DC_YLW,  DC_YLW,                             DC_BLU,                    DC_YLW,  DC_YLW,  DC_YLW,  DC_YLW,  DC_YLW,   DC_YLW,
+    // Row 0: ESC → BSPC (x: 0…198)
+    GRAD( 96), GRAD(100), GRAD(104), GRAD(108), GRAD(113), GRAD(117), GRAD(121), GRAD(125), GRAD(129), GRAD(133), GRAD(137), GRAD(141), GRAD(146), GRAD(152),
+    // Row 1: TAB → DEL (x: 4…224)
+    GRAD( 97), GRAD(102), GRAD(106), GRAD(110), GRAD(115), GRAD(119), GRAD(123), GRAD(127), GRAD(131), GRAD(135), GRAD(139), GRAD(143), GRAD(147), GRAD(153), GRAD(159),
+    // Row 2: CAPS → HOME (x: 6…224)
+    GRAD( 98), GRAD(103), GRAD(107), GRAD(111), GRAD(116), GRAD(120), GRAD(124), GRAD(128), GRAD(132), GRAD(136), GRAD(140), GRAD(144), GRAD(149), GRAD(159),
+    // Row 3: LSFT → UP (x: 2…209)
+    GRAD( 97), GRAD(101), GRAD(105), GRAD(110), GRAD(113), GRAD(118), GRAD(122), GRAD(126), GRAD(130), GRAD(134), GRAD(138), GRAD(142), GRAD(148), GRAD(155),
+    // Row 4: LCTL → RIGHT (x: 2…224)
+    GRAD( 97), GRAD(102), GRAD(107), GRAD(122), GRAD(137), GRAD(141), GRAD(146), GRAD(151), GRAD(155), GRAD(159),
 };
 
 // Default Mixed RGB Region
