@@ -16,6 +16,10 @@
 
 #include QMK_KEYBOARD_H
 #include "keychron_common.h"
+#ifdef RGB_MATRIX_ENABLE
+#    include "lpm.h"
+#    include "keychron_rgb_type.h"
+#endif
 
 enum layers {
     MAC_BASE,
@@ -75,3 +79,28 @@ const uint16_t PROGMEM encoder_map[][NUM_ENCODERS][2] = {
     [FN2]      = { ENCODER_CCW_CW(_______, _______) }
 };
 #endif // ENCODER_MAP_ENABLE
+#ifdef RGB_MATRIX_ENABLE
+extern uint8_t per_key_rgb_type;
+
+void matrix_scan_user(void) {
+    static bool     last_usb_state = false;
+    static bool     initialized    = false;
+    static uint32_t last_check     = 0;
+
+    if (timer_elapsed32(last_check) < 200) return;
+    last_check = timer_read32();
+
+    // Use a full color effect using a wire and a low energy glow on battery
+    bool usb_now = usb_power_connected();
+    if (!initialized || usb_now != last_usb_state) {
+        initialized    = true;
+        last_usb_state = usb_now;
+        if (usb_now) {
+            per_key_rgb_type = PER_KEY_RGB_SOLID;
+            rgb_matrix_mode_noeeprom(RGB_MATRIX_CUSTOM_PER_KEY_RGB);
+        } else {
+            rgb_matrix_mode_noeeprom(RGB_MATRIX_SOLID_REACTIVE_MULTIWIDE);
+        }
+    }
+}
+#endif
