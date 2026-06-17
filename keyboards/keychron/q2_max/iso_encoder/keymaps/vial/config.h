@@ -7,6 +7,12 @@
 #define VIAL_UNLOCK_COMBO_ROWS { 0, 1 }
 #define VIAL_UNLOCK_COMBO_COLS { 0, 13 }
 
+// Custom multi-slot live macro recorder (see keymap.c)
+#define MACRO_SLOT_COUNT 5
+#define MACRO_MAX_EVENTS 64    // ~32 keystrokes (press+release) per slot
+#define MACRO_NODELAY_MS 2     // fixed gap in no-delay mode (never 0 — hosts drop same-poll reports)
+#define DREC_TAP_TERM    200   // double-tap window (ms) for real-delay arming
+
 #ifdef RGB_MATRIX_ENABLE
 #    define RGB_MATRIX_KEYREACTIVE_ENABLED
 #    define ENABLE_RGB_MATRIX_SOLID_REACTIVE_MULTIWIDE
