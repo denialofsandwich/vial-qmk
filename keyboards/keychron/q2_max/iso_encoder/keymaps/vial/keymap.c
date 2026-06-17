@@ -33,7 +33,7 @@ enum layers {
 enum custom_keycodes {
     M0 = SAFE_RANGE,
     RCTRL_LOOP,
-    LCLICK_LOOP,
+    REPEAT_LOOP,
 };
 
 #define FN1_MAC MO(MAC_FN1)
@@ -71,8 +71,8 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
 
     [FN2] = LAYOUT_iso_68(
         KC_TILD,  KC_F1,    KC_F2,    KC_F3,    KC_F4,    KC_F5,    KC_F6,    KC_F7,    KC_F8,    KC_F9,    KC_F10,   KC_F11,   KC_F12,   _______,            _______,
-        _______,  DM_REC1,  DM_REC2,  DM_RSTP,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,                      _______,
-        _______,  DM_PLY1,  DM_PLY2,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______, LCLICK_LOOP,            _______,
+        _______,  DM_REC1,  DM_REC2,  DM_RSTP,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  KC_BTN1,                      _______,
+        _______,  DM_PLY1,  DM_PLY2,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______, REPEAT_LOOP,            _______,
         _______,  _______,  _______,  _______,  _______,  _______,  BAT_LVL,  _______,  _______,  _______,  _______,  _______,            _______,  _______,
         RCTRL_LOOP, _______,  _______,                              _______,                                _______,  _______,  _______,  _______,  _______,  _______)
 };
@@ -88,7 +88,7 @@ const uint16_t PROGMEM encoder_map[][NUM_ENCODERS][2] = {
 #endif // ENCODER_MAP_ENABLE
 
 static bool rctrl_loop_active  = false;
-static bool lclick_loop_active = false;
+static bool repeat_loop_active = false;
 
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     switch (keycode) {
@@ -102,10 +102,22 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
                 rctrl_loop_active = !rctrl_loop_active;
             }
             return false;
-        case LCLICK_LOOP:
+        case REPEAT_LOOP:
             if (record->event.pressed) {
-                lclick_loop_active = !lclick_loop_active;
+                repeat_loop_active = !repeat_loop_active;
             }
+            return false;
+    }
+    return true;
+}
+
+// Keep our custom macro/toggle keycodes out of the Repeat Key memory, so the
+// spam loop repeats the last "real" key pressed instead of the toggle itself.
+bool remember_last_key_user(uint16_t keycode, keyrecord_t *record, uint8_t *remembered_mods) {
+    switch (keycode) {
+        case M0:
+        case RCTRL_LOOP:
+        case REPEAT_LOOP:
             return false;
     }
     return true;
@@ -115,15 +127,19 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
 extern uint8_t per_key_rgb_type;
 
 void matrix_scan_user(void) {
-    static uint32_t lclick_timer = 0;
-    if (lclick_loop_active) {
+    static uint32_t repeat_timer = 0;
+    if (repeat_loop_active) {
         lpm_timer_reset();
-        if (timer_elapsed32(lclick_timer) >= 50) {
-            lclick_timer = timer_read32();
-            tap_code(KC_BTN1);
+        if (timer_elapsed32(repeat_timer) >= 50) {
+            repeat_timer = timer_read32();
+            // Re-fire the last pressed key via the QMK Repeat Key feature.
+            keyevent_t press = MAKE_KEYEVENT(0, 0, true);
+            repeat_key_invoke(&press);
+            keyevent_t release = MAKE_KEYEVENT(0, 0, false);
+            repeat_key_invoke(&release);
         }
     } else {
-        lclick_timer = timer_read32();
+        repeat_timer = timer_read32();
     }
 
     static uint32_t rctrl_timer = 0;
@@ -162,7 +178,7 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
     if (rctrl_loop_active && led_min <= 57 && 57 < led_max) {
         rgb_matrix_set_color(57, 0x00, 0xFF, 0x00);
     }
-    if (lclick_loop_active && led_min <= 27 && 27 < led_max) {
+    if (repeat_loop_active && led_min <= 27 && 27 < led_max) {
         rgb_matrix_set_color(27, 0x00, 0xFF, 0x00);
     }
     return false;
