@@ -30,8 +30,11 @@ enum layers {
     FN2,
 };
 
+// Base these in Keychron's QK_KB custom range (NEW_SAFE_RANGE), not QK_USER/SAFE_RANGE,
+// so Vial's customKeycodes[] (indexed from QK_KB_0) can give them friendly labels.
+// The order here must match the appended entries in vial.json.
 enum custom_keycodes {
-    M0 = SAFE_RANGE,
+    M0 = NEW_SAFE_RANGE,
     RCTRL_LOOP,
     REPEAT_LOOP,
     DREC,        // FN2+Tab: record/stop toggle (single tap = no delay, double tap = real delays)
@@ -41,6 +44,7 @@ enum custom_keycodes {
     MSLOT_4,     // FN2+R : macro slot 4
     MSLOT_5,     // FN2+T : macro slot 5
 };
+_Static_assert(MSLOT_5 <= 0x7E1F, "custom keycodes overflow the QK_KB range (0x7E1F)");
 
 // clang-format off
 const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
@@ -101,7 +105,7 @@ static bool repeat_loop_active = false;
 //               while idle  -> play that slot
 //               while playing -> stop (interrupt)
 // FN2+Tab     : while recording -> stop
-// FN2+D       : loop the last played slot (or, if none, the legacy "repeat last key")
+// FN2+Enter   : loop the last played slot (or, if none, the legacy "repeat last key")
 //
 // Storage is RAM-only (lost on power-off). Each event stores the keycode, the
 // delay since the previous event, and whether it was a press or release.
