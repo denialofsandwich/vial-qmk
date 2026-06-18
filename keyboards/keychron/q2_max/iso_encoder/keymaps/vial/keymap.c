@@ -241,10 +241,14 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
             }
             if (macro_state == ST_RECORDING) {
                 stop_recording();
-            } else if (macro_state == ST_ARMED && timer_elapsed32(drec_tap_timer) < DREC_TAP_TERM) {
-                armed_realdelay = true;            // double tap -> measure real delays
+            } else if (macro_state == ST_ARMED) {
+                if (timer_elapsed32(drec_tap_timer) < DREC_TAP_TERM) {
+                    armed_realdelay = true;        // quick double tap -> measure real delays
+                } else {
+                    macro_state = ST_IDLE;         // settled press while armed -> abort
+                }
             } else {
-                armed_realdelay = false;           // single tap -> no delay
+                armed_realdelay = false;           // single tap -> arm (no delay)
                 macro_state     = ST_ARMED;
             }
             drec_tap_timer = timer_read32();
