@@ -272,6 +272,14 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
         return false;
     }
 
+    // A normal key press becomes the new "last action", so FN2+Enter goes back to
+    // repeating that key instead of staying stuck on the last played macro slot.
+    // is_recordable() conveniently excludes layer keys (holding FN2 to reach Enter
+    // won't reset this) and our own macro/toggle keycodes.
+    if (record->event.pressed && is_recordable(keycode, record)) {
+        last_macro_slot = -1;
+    }
+
     // capture live keystrokes while recording
     if (macro_state == ST_RECORDING && is_recordable(keycode, record)) {
         record_event(keycode, record->event.pressed);
