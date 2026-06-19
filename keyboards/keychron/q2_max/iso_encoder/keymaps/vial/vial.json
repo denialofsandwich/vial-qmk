@@ -129,6 +129,31 @@
             "name": "Macro Slot 5",
             "title": "Macro slot 5: play, or record when armed",
             "shortName": "Mac5"
+        },
+        {
+            "name": "Macro Slot 6",
+            "title": "Macro slot 6: play, or record when armed",
+            "shortName": "Mac6"
+        },
+        {
+            "name": "Macro Slot 7",
+            "title": "Macro slot 7: play, or record when armed",
+            "shortName": "Mac7"
+        },
+        {
+            "name": "Macro Slot 8",
+            "title": "Macro slot 8: play, or record when armed",
+            "shortName": "Mac8"
+        },
+        {
+            "name": "Macro Slot 9",
+            "title": "Macro slot 9: play, or record when armed",
+            "shortName": "Mac9"
+        },
+        {
+            "name": "Macro Slot 10",
+            "title": "Macro slot 10: play, or record when armed",
+            "shortName": "Mac10"
         }
     ],
     "matrix": {

@@ -12,8 +12,8 @@
 #define NO_ALT_REPEAT_KEY
 
 // Custom multi-slot live macro recorder (see keymap.c)
-#define MACRO_SLOT_COUNT 5
-#define MACRO_MAX_EVENTS 64    // ~32 keystrokes (press+release) per slot
+#define MACRO_SLOT_COUNT 10
+#define MACRO_MAX_EVENTS 128   // ~64 keystrokes (press+release) per slot
 #define MACRO_NODELAY_MS 2     // fixed gap in no-delay mode (never 0 — hosts drop same-poll reports)
 #define DREC_TAP_TERM    200   // double-tap window (ms) for real-delay arming
 

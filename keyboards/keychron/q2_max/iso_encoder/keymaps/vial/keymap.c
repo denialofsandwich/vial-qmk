@@ -43,8 +43,13 @@ enum custom_keycodes {
     MSLOT_3,     // FN2+E : macro slot 3
     MSLOT_4,     // FN2+R : macro slot 4
     MSLOT_5,     // FN2+T : macro slot 5
+    MSLOT_6,     // FN2+Y : macro slot 6
+    MSLOT_7,     // FN2+U : macro slot 7
+    MSLOT_8,     // FN2+I : macro slot 8
+    MSLOT_9,     // FN2+O : macro slot 9
+    MSLOT_10,    // FN2+P : macro slot 10
 };
-_Static_assert(MSLOT_5 <= 0x7E1F, "custom keycodes overflow the QK_KB range (0x7E1F)");
+_Static_assert(MSLOT_10 <= 0x7E1F, "custom keycodes overflow the QK_KB range (0x7E1F)");
 
 // clang-format off
 const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
@@ -78,7 +83,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
 
     [FN2] = LAYOUT_iso_68(
         KC_TILD,  KC_F1,    KC_F2,    KC_F3,    KC_F4,    KC_F5,    KC_F6,    KC_F7,    KC_F8,    KC_F9,    KC_F10,   KC_F11,   KC_F12,   _______,            _______,
-        DREC,     MSLOT_1,  MSLOT_2,  MSLOT_3,  MSLOT_4,  MSLOT_5,  _______,  _______,  _______,  _______,  _______,  _______,  KC_BTN1,                      _______,
+        DREC,     MSLOT_1,  MSLOT_2,  MSLOT_3,  MSLOT_4,  MSLOT_5,  MSLOT_6,  MSLOT_7,  MSLOT_8,  MSLOT_9,  MSLOT_10, _______,  KC_BTN1,                      _______,
         _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______, REPEAT_LOOP,            _______,
         _______,  _______,  _______,  _______,  _______,  _______,  BAT_LVL,  _______,  _______,  _______,  _______,  _______,            _______,  _______,
         RCTRL_LOOP, _______,  _______,                              _______,                                _______,  _______,  _______,  _______,  _______,  _______)
@@ -161,7 +166,7 @@ static uint16_t       play_wait       = 0;                // ms to wait before p
 static int8_t         last_macro_slot = -1;              // last slot played (for FN2+Enter loop)
 
 static inline int8_t slot_index(uint16_t keycode) {
-    if (keycode >= MSLOT_1 && keycode <= MSLOT_5) return (int8_t)(keycode - MSLOT_1);
+    if (keycode >= MSLOT_1 && keycode <= MSLOT_10) return (int8_t)(keycode - MSLOT_1);
     return -1;
 }
 
@@ -495,9 +500,9 @@ void matrix_scan_user(void) {
     }
 }
 
-// LED indices for the macro keys (matrix row 1: Tab, Q, W, E, R, T)
+// LED indices for the macro keys (matrix row 1: Tab, Q, W, E, R, T, Y, U, I, O, P)
 #define MACRO_TAB_LED 14
-static const uint8_t macro_slot_led[MACRO_SLOT_COUNT] = {15, 16, 17, 18, 19};
+static const uint8_t macro_slot_led[MACRO_SLOT_COUNT] = {15, 16, 17, 18, 19, 20, 21, 22, 23, 24};
 
 // General macro-status colors (one place to retune them).
 #define MACRO_C_ACTIVE   0x00, 0xFF, 0x00   // green   — executing slot / active loop toggle
