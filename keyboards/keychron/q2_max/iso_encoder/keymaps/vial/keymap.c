@@ -21,6 +21,9 @@
 #    include "lpm.h"
 #    include "keychron_rgb_type.h"
 #endif
+#if defined(PROTOCOL_CHIBIOS) && defined(LK_WIRELESS_ENABLE)
+#    include <usb_main.h>
+#endif
 
 enum layers {
     MAC_BASE,
@@ -398,6 +401,22 @@ bool remember_last_key_user(uint16_t keycode, keyrecord_t *record, uint8_t *reme
     }
     return true;
 }
+
+// When a macro or keep-alive loop is active during USB host suspension,
+// send a remote wakeup so the host wakes up and receives the key output.
+// Without this, Keychron's usb_remote_wakeup() loop (transport.c) never
+// calls matrix_scan_user(), so the macro stalls until a physical key is pressed.
+#if defined(PROTOCOL_CHIBIOS) && defined(LK_WIRELESS_ENABLE)
+void suspend_power_down_user(void) {
+    static uint32_t wakeup_timer = 0;
+    if ((play_depth > 0 || repeat_loop_active || rctrl_loop_active)
+        && USB_DRIVER.state == USB_SUSPENDED
+        && timer_elapsed32(wakeup_timer) > 500) {
+        wakeup_timer = timer_read32();
+        usbWakeupHost(&USB_DRIVER);
+    }
+}
+#endif
 
 #ifdef RGB_MATRIX_ENABLE
 extern uint8_t per_key_rgb_type;
