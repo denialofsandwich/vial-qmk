@@ -362,6 +362,22 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     }
 
     switch (keycode) {
+        // Mac Layer only: Remap Ctrl+Left/Right/Backspace to Alt(option)+Left/Right/Backspace
+        case KC_LEFT:
+        case KC_RIGHT:
+        case KC_BSPC: {
+            if (record->event.pressed && get_highest_layer(default_layer_state) == MAC_BASE) {
+                uint8_t mods      = get_mods();
+                uint8_t ctrl_mods = mods & MOD_MASK_GUI;
+                if (ctrl_mods && !(mods & ~MOD_MASK_GUI)) {
+                    del_mods(ctrl_mods);
+                    tap_code16(LALT(keycode));
+                    add_mods(ctrl_mods);
+                    return false;
+                }
+            }
+            break;
+        }
         case M0:
             if (record->event.pressed) {
                 SEND_STRING(M0_SEQ);
