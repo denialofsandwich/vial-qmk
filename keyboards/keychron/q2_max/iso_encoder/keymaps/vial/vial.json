@@ -154,6 +154,11 @@
             "name": "Macro Slot 10",
             "title": "Macro slot 10: play, or record when armed",
             "shortName": "Mac10"
+        },
+        {
+            "name": "Hold Loop",
+            "title": "Toggle: hold down the last key pressed",
+            "shortName": "HoldLp"
         }
     ],
     "matrix": {

@@ -51,8 +51,9 @@ enum custom_keycodes {
     MSLOT_8,     // FN2+I : macro slot 8
     MSLOT_9,     // FN2+O : macro slot 9
     MSLOT_10,    // FN2+P : macro slot 10
+    HOLD_LOOP,   // FN2+Backspace: hold down the last key pressed
 };
-_Static_assert(MSLOT_10 <= 0x7E1F, "custom keycodes overflow the QK_KB range (0x7E1F)");
+_Static_assert(HOLD_LOOP <= 0x7E1F, "custom keycodes overflow the QK_KB range (0x7E1F)");
 
 // clang-format off
 const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
@@ -85,7 +86,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
         _______,  _______,  _______,                                _______,                                _______,  _______,  _______,  _______,  KC_PGDN,  _______),
 
     [FN2] = LAYOUT_iso_68(
-        KC_TILD,  KC_F1,    KC_F2,    KC_F3,    KC_F4,    KC_F5,    KC_F6,    KC_F7,    KC_F8,    KC_F9,    KC_F10,   KC_F11,   KC_F12,   _______,            _______,
+        KC_TILD,  KC_F1,    KC_F2,    KC_F3,    KC_F4,    KC_F5,    KC_F6,    KC_F7,    KC_F8,    KC_F9,    KC_F10,   KC_F11,   KC_F12,   HOLD_LOOP,          _______,
         DREC,     MSLOT_1,  MSLOT_2,  MSLOT_3,  MSLOT_4,  MSLOT_5,  MSLOT_6,  MSLOT_7,  MSLOT_8,  MSLOT_9,  MSLOT_10, MS_BTN4,  MS_BTN1,                      MS_WHLU,
         _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  MS_BTN5,  MS_BTN2, REPEAT_LOOP,            MS_WHLD,
         _______,  _______,  _______,  _______,  _______,  _______,  BAT_LVL,  _______,  _______,  _______,  _______,  _______,            MS_BTN3,  MS_UP,
@@ -104,6 +105,10 @@ const uint16_t PROGMEM encoder_map[][NUM_ENCODERS][2] = {
 
 static bool rctrl_loop_active  = false;
 static bool repeat_loop_active = false;
+
+static bool     hold_loop_active = false;
+static uint16_t hold_keycode     = KC_NO;  // key currently held down by the hold loop
+static uint8_t  hold_mods        = 0;
 
 // ---------------------------------------------------------------------------
 // Custom multi-slot live macro recorder
@@ -182,6 +187,7 @@ static bool is_recordable(uint16_t keycode, keyrecord_t *record) {
         case M0:
         case RCTRL_LOOP:
         case REPEAT_LOOP:
+        case HOLD_LOOP:
             return false;
     }
     // don't record layer-switching keys (e.g. MO(FN2)) — they replay nonsensically
@@ -304,11 +310,23 @@ static void stop_playback(void) {
     clear_keyboard();  // release anything the macro left held
 }
 
+// Release the key held down by the hold loop (if any) and clear its state.
+static void stop_hold_loop(void) {
+    if (hold_keycode != KC_NO) {
+        unregister_code16(hold_keycode);
+        unregister_mods(hold_mods);
+    }
+    hold_keycode     = KC_NO;
+    hold_mods        = 0;
+    hold_loop_active = false;
+}
+
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     int8_t slot = slot_index(keycode);
 
     if (keycode == DREC) {
         if (record->event.pressed) {
+            stop_hold_loop();
             if (play_depth > 0) {
                 stop_playback();
                 repeat_loop_active = false;
@@ -332,6 +350,7 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
 
     if (slot >= 0) {
         if (record->event.pressed) {
+            stop_hold_loop();
             if (play_depth > 0) {                  // press during playback -> interrupt
                 stop_playback();
                 repeat_loop_active = false;
@@ -390,14 +409,32 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
             return false;
         case REPEAT_LOOP:
             if (record->event.pressed) {
+                stop_hold_loop();  // mutually exclusive with the hold loop
                 repeat_loop_active = !repeat_loop_active;
                 if (repeat_loop_active) {
                     if (last_macro_slot >= 0 && macro_len[last_macro_slot] > 0) {
                         start_playback((uint8_t)last_macro_slot, true);  // loop the macro
                     }
-                    // else: legacy "repeat last key" handled in matrix_scan_user
+                    // else: "repeat last key" handled in matrix_scan_user
                 } else {
                     stop_playback();
+                }
+            }
+            return false;
+        case HOLD_LOOP:
+            if (record->event.pressed) {
+                if (hold_loop_active) {
+                    stop_hold_loop();
+                } else {
+                    // mutually exclusive with the repeat / macro loop
+                    if (repeat_loop_active) { repeat_loop_active = false; stop_playback(); }
+                    hold_keycode = get_last_keycode();
+                    hold_mods    = get_last_mods();
+                    if (hold_keycode != KC_NO) {
+                        hold_loop_active = true;
+                        register_mods(hold_mods);
+                        register_code16(hold_keycode);
+                    }
                 }
             }
             return false;
@@ -408,11 +445,15 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
 // Keep our custom macro/toggle keycodes out of the Repeat Key memory, so the
 // spam loop repeats the last "real" key pressed instead of the toggle itself.
 bool remember_last_key_user(uint16_t keycode, keyrecord_t *record, uint8_t *remembered_mods) {
+    // While a loop is running, keep the target locked to the key pressed before it
+    // started — don't let keys tapped during the loop overwrite the repeat/hold target.
+    if (repeat_loop_active || hold_loop_active) return false;
     if (keycode == DREC || slot_index(keycode) >= 0) return false;
     switch (keycode) {
         case M0:
         case RCTRL_LOOP:
         case REPEAT_LOOP:
+        case HOLD_LOOP:
             return false;
     }
     return true;
@@ -425,7 +466,7 @@ bool remember_last_key_user(uint16_t keycode, keyrecord_t *record, uint8_t *reme
 #if defined(PROTOCOL_CHIBIOS) && defined(LK_WIRELESS_ENABLE)
 void suspend_power_down_user(void) {
     static uint32_t wakeup_timer = 0;
-    if ((play_depth > 0 || repeat_loop_active || rctrl_loop_active)
+    if ((play_depth > 0 || repeat_loop_active || rctrl_loop_active || hold_loop_active)
         && USB_DRIVER.state == USB_SUSPENDED
         && timer_elapsed32(wakeup_timer) > 500) {
         wakeup_timer = timer_read32();
@@ -503,6 +544,9 @@ void matrix_scan_user(void) {
         repeat_timer = timer_read32();
     }
 
+    // Keep the board awake while a key is held, so sleep doesn't drop the held report.
+    if (hold_loop_active) lpm_timer_reset();
+
     static uint32_t rctrl_timer = 0;
     if (rctrl_loop_active) {
         lpm_timer_reset();
@@ -556,6 +600,7 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
     // Loop-style toggles: solid green while active.
     macro_led(led_min, led_max, rctrl_loop_active  ? 57 : NO_LED, MACRO_C_ACTIVE);
     macro_led(led_min, led_max, repeat_loop_active ? 27 : NO_LED, MACRO_C_ACTIVE);
+    macro_led(led_min, led_max, hold_loop_active   ? 13 : NO_LED, MACRO_C_ACTIVE);
 
     // Armed: Tab key — magenta for real-delay, yellow for no-delay.
     if (macro_state == ST_ARMED) {
