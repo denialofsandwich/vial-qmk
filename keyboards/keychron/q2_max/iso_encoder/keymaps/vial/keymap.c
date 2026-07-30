@@ -111,67 +111,63 @@ static uint16_t hold_keycode     = KC_NO;  // key currently held down by the hol
 static uint8_t  hold_mods        = 0;
 
 // ---------------------------------------------------------------------------
-// Custom multi-slot live macro recorder
+// Custom multi-slot live macro recorder. Storage is RAM-only (lost on power-off).
 //
-// FN2+Tab     : arm recording (single tap = no delay, double tap = real delays)
-// FN2+Q..T    : while armed     -> start recording into that slot
-//               while recording -> record a "call slot N" event (recursive macro)
-//               while idle      -> play that slot
-//               while playing   -> stop (interrupt)
-// FN2+Tab     : while recording -> stop
-// FN2+Enter   : loop the last played slot (or, if none, the legacy "repeat last key")
+// FN2+Tab   : idle -> arm (single tap = no delay, double tap = real delays)
+//             recording -> stop; also the escape hatch out of any state
+// FN2+Q..P  : armed -> record into that slot | idle -> play it
+//             recording -> play it live AND record a call to it (compose macros)
+//             playing -> interrupt
+// FN2+Enter : loop the last played slot, else "repeat last key". Ignored while
+//             armed or recording (a loop records nothing and, since a call is only
+//             recorded when nothing plays, would swallow every slot press).
 //
-// Capacity: each slot holds MACRO_MAX_EVENTS events, but a recording is not
-// limited to one slot. A macro event can be a key (EV_KEY) or a "call another
-// slot" (EV_CALL); playback uses a stack so a slot can recurse into other slots
-// and resume the caller when they return. Two ways calls appear:
-//   * recursive call  — pressing a slot key while recording records EV_CALL.
-//   * overflow chain  — when a slot fills mid-recording, an EV_CALL to the next
-//                       sequential slot is appended and recording continues there
-//                       (overwriting it). This lets one long macro span slots.
-// LED feedback (see rgb_matrix_indicators_advanced_user): the slot currently
-// executing is green, every caller still on the stack is yellow.
-//
-// Storage is RAM-only (lost on power-off). Each event stores the keycode (or
-// target slot for EV_CALL), the delay since the previous event, and whether it
-// was a press or release.
+// An event is a key (EV_KEY) or a call into another slot (EV_CALL); playback walks a
+// frame stack, so calls nest and resume their caller. Calls come from composing (see
+// process_record_user) and from overflow: a slot that fills mid-recording calls the
+// next slot and continues there, so one macro can span slots.
+// Quirk: keys typed while a call plays replay after it, not interleaved.
 // ---------------------------------------------------------------------------
 typedef enum { EV_KEY, EV_CALL } macro_evtype_t;
 
 typedef struct {
     uint16_t keycode;   // EV_KEY: keycode to (un)register; EV_CALL: target slot index
-    uint16_t delay_ms;  // time since previous recorded event
-    uint8_t  type;      // EV_KEY or EV_CALL
+    uint16_t delay_ms;  // pause that followed this event
+    uint8_t  type;
     bool     pressed;
 } macro_event_t;
 
 typedef enum { ST_IDLE, ST_ARMED, ST_RECORDING } macro_state_t;
 
 static macro_event_t macro_store[MACRO_SLOT_COUNT][MACRO_MAX_EVENTS];
-static uint16_t       macro_len[MACRO_SLOT_COUNT];       // events recorded per slot
+static uint16_t       macro_len[MACRO_SLOT_COUNT];
 static bool           macro_realdelay[MACRO_SLOT_COUNT]; // playback honors real delays?
-static uint16_t       macro_trail[MACRO_SLOT_COUNT];     // last-key -> stop gap (loop spacing)
 
 static macro_state_t  macro_state     = ST_IDLE;
-static bool           armed_realdelay = false;           // mode chosen at arm time
+static bool           armed_realdelay = false;
 static uint8_t        active_slot     = 0;               // slot currently being recorded into
 static uint8_t        rec_root_slot   = 0;               // slot the recording started in
 static uint32_t       drec_tap_timer  = 0;               // double-tap detection
 static uint32_t       last_event_time = 0;               // for inter-event delta
+static uint16_t       rec_called_mask = 0;               // slots this recording calls
+static macro_event_t *last_ev         = NULL;            // event awaiting its delay
 
-// Non-blocking playback uses a call stack so a slot can recurse into other slots
-// (explicit recursive calls and overflow chaining both ride on EV_CALL events).
 typedef struct { uint8_t slot; uint16_t pos; } play_frame_t;
 #define MACRO_PLAY_STACK_DEPTH 16                        // caps recursion / cyclic calls
 
 static play_frame_t   play_stack[MACRO_PLAY_STACK_DEPTH];
-static uint8_t        play_depth      = 0;               // 0 == idle (replaces old `playing`)
+static uint8_t        play_depth      = 0;               // 0 == not playing
 static uint8_t        play_root       = 0;               // slot to restart from when looping
-static uint8_t        play_last_key_slot = 0;            // slot of last real key (loop trail gap)
-static bool           play_loop       = false;           // restart when finished
+static bool           play_loop       = false;
 static uint32_t       play_timer      = 0;               // when current step's wait started
 static uint16_t       play_wait       = 0;                // ms to wait before processing top frame
 static int8_t         last_macro_slot = -1;              // last slot played (for FN2+Enter loop)
+
+// Keys playback registered, so teardown releases exactly those (see release_play_held).
+#define MACRO_PLAY_HELD_MAX 16
+static uint16_t       play_held[MACRO_PLAY_HELD_MAX];
+static uint8_t        play_nheld         = 0;
+static bool           play_held_overflow = false;
 
 static inline int8_t slot_index(uint16_t keycode) {
     if (keycode >= MSLOT_1 && keycode <= MSLOT_10) return (int8_t)(keycode - MSLOT_1);
@@ -179,6 +175,12 @@ static inline int8_t slot_index(uint16_t keycode) {
 }
 
 static uint16_t clamp_u16(uint32_t v) { return v > 0xFFFF ? 0xFFFF : (uint16_t)v; }
+
+// Slots rec_root_slot..active_slot are still being written, so playing one would feed
+// the recording into itself. Also checked per EV_CALL: a callee may call back in.
+static inline bool call_blocked(uint8_t slot) {
+    return macro_state == ST_RECORDING && slot >= rec_root_slot && slot <= active_slot;
+}
 
 static bool is_recordable(uint16_t keycode, keyrecord_t *record) {
     if (record->event.type != KEY_EVENT) return false;   // skip encoder events
@@ -200,20 +202,26 @@ static bool is_recordable(uint16_t keycode, keyrecord_t *record) {
     return true;
 }
 
+// An event's delay is the pause that followed it, which is only known once the next
+// event arrives (or recording stops) — so it is written back then, not on append.
+static void close_interval(void) {
+    if (last_ev) last_ev->delay_ms = clamp_u16(timer_elapsed32(last_event_time));
+}
+
 static void stop_recording(void) {
     if (macro_state != ST_RECORDING) return;
+    close_interval();
     uint8_t s = active_slot;
-    macro_trail[s] = (macro_len[s] == 0) ? 0 : clamp_u16(timer_elapsed32(last_event_time));
 
-    // Append releases for any keys still held at stop, so playback (and looping)
-    // never leaves a key stuck down. Scan the whole recorded chain (rec_root_slot
-    // .. active_slot, which is sequential) so a key pressed before an overflow
-    // boundary and never released still gets a release at the very end.
+    // Release keys still held at stop, so playback never sticks one down. Scans the
+    // whole chain to catch presses from before an overflow. close_interval() above put
+    // the pause on the last real event, so a key held until the stop key stays held
+    // that long on playback.
     uint16_t held[MACRO_MAX_EVENTS];
     uint8_t  nheld = 0;
     for (uint8_t cs = rec_root_slot; cs <= s; cs++) {
         for (uint16_t i = 0; i < macro_len[cs]; i++) {
-            if (macro_store[cs][i].type == EV_CALL) continue;
+            if (macro_store[cs][i].type != EV_KEY) continue;
             uint16_t kc = macro_store[cs][i].keycode;
             if (macro_store[cs][i].pressed) {
                 bool found = false;
@@ -234,15 +242,16 @@ static void stop_recording(void) {
     macro_state = ST_IDLE;
 }
 
-// Reserve the final buffer entry of every slot for a chain call: when the active
-// slot is about to fill, append an EV_CALL to the next sequential slot and continue
-// recording there (overwriting it). Returns false only when there is genuinely no
-// slot left to chain into, so the caller should stop recording.
+// Keep one entry free per slot for the overflow call. False = nowhere left to chain,
+// so the caller must stop recording.
 static bool ensure_record_room(void) {
     uint16_t *len = &macro_len[active_slot];
     if (*len < MACRO_MAX_EVENTS - 1) return true;       // room for one more event
     if (active_slot + 1 >= MACRO_SLOT_COUNT) return false;
     uint8_t next = active_slot + 1;
+    // Stop rather than chain over a slot this recording calls: that call would end up
+    // pointing at our own continuation, and wiping a slot mid-playback pops its frame.
+    if (rec_called_mask & ((uint16_t)1 << next)) return false;
     macro_store[active_slot][*len].keycode  = next;     // chain call at the reserved entry
     macro_store[active_slot][*len].delay_ms = 0;
     macro_store[active_slot][*len].type     = EV_CALL;
@@ -251,35 +260,33 @@ static bool ensure_record_room(void) {
     active_slot           = next;
     macro_len[next]       = 0;
     macro_realdelay[next] = armed_realdelay;
-    macro_trail[next]     = 0;
     return true;
 }
 
-// Append an "execute slot `target`" event to the current recording. Used both for
-// explicit recursive calls (pressing a slot key while recording) and indirectly via
-// the overflow chain above.
+static macro_event_t *append_event(uint8_t type) {
+    close_interval();
+    if (!ensure_record_room()) { stop_recording(); return NULL; }
+    macro_event_t *e = &macro_store[active_slot][macro_len[active_slot]++];
+    e->delay_ms      = 0;
+    e->type          = type;
+    e->pressed       = false;
+    last_ev          = e;
+    last_event_time  = timer_read32();
+    return e;
+}
+
 static void record_call(uint8_t target) {
-    if (!ensure_record_room()) { stop_recording(); return; }
-    uint16_t *len  = &macro_len[active_slot];
-    uint16_t delta = (*len == 0) ? 0 : clamp_u16(timer_elapsed32(last_event_time));
-    macro_store[active_slot][*len].keycode  = target;
-    macro_store[active_slot][*len].delay_ms = delta;
-    macro_store[active_slot][*len].type     = EV_CALL;
-    macro_store[active_slot][*len].pressed  = false;
-    (*len)++;
-    last_event_time = timer_read32();
+    macro_event_t *e = append_event(EV_CALL);
+    if (!e) return;
+    e->keycode       = target;
+    rec_called_mask |= (uint16_t)1 << target;
 }
 
 static void record_event(uint16_t keycode, bool pressed) {
-    if (!ensure_record_room()) { stop_recording(); return; }
-    uint16_t *len  = &macro_len[active_slot];
-    uint16_t delta = (*len == 0) ? 0 : clamp_u16(timer_elapsed32(last_event_time));
-    macro_store[active_slot][*len].keycode  = keycode;
-    macro_store[active_slot][*len].delay_ms = delta;
-    macro_store[active_slot][*len].type     = EV_KEY;
-    macro_store[active_slot][*len].pressed  = pressed;
-    (*len)++;
-    last_event_time = timer_read32();
+    macro_event_t *e = append_event(EV_KEY);
+    if (!e) return;
+    e->keycode = keycode;
+    e->pressed = pressed;
 }
 
 static void start_recording(uint8_t slot) {
@@ -287,18 +294,28 @@ static void start_recording(uint8_t slot) {
     rec_root_slot         = slot;
     macro_len[slot]       = 0;
     macro_realdelay[slot] = armed_realdelay;
-    macro_trail[slot]     = 0;
+    rec_called_mask       = 0;
+    last_ev               = NULL;
     last_event_time       = timer_read32();
     macro_state           = ST_RECORDING;
 }
 
+// Not clear_keyboard(): that would also drop keys and mods the user physically holds
+// while a called macro ends (and wipe mousekeys).
+static void release_play_held(void) {
+    if (play_held_overflow) clear_keyboard();            // fallback: never leave a key stuck
+    else while (play_nheld) unregister_code16(play_held[--play_nheld]);
+    play_nheld         = 0;
+    play_held_overflow = false;
+}
+
 static void start_playback(uint8_t slot, bool loop) {
     if (macro_len[slot] == 0) return;
+    if (play_depth > 0) release_play_held();             // restarting over a live playback
     play_stack[0].slot = slot;
     play_stack[0].pos  = 0;
     play_depth         = 1;
     play_root          = slot;
-    play_last_key_slot = slot;
     play_loop          = loop;
     play_wait          = 0;
     play_timer         = timer_read32();
@@ -307,10 +324,12 @@ static void start_playback(uint8_t slot, bool loop) {
 static void stop_playback(void) {
     play_depth = 0;
     play_loop  = false;
-    clear_keyboard();  // release anything the macro left held
+    release_play_held();
+    // A call's live duration must not inflate the interval being recorded: the replay
+    // re-runs the call, so that time is spent there too.
+    if (macro_state == ST_RECORDING) last_event_time = timer_read32();
 }
 
-// Release the key held down by the hold loop (if any) and clear its state.
 static void stop_hold_loop(void) {
     if (hold_keycode != KC_NO) {
         unregister_code16(hold_keycode);
@@ -327,10 +346,10 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     if (keycode == DREC) {
         if (record->event.pressed) {
             stop_hold_loop();
-            if (play_depth > 0) {
-                stop_playback();
-                repeat_loop_active = false;
-            }
+            if (play_depth > 0) stop_playback();
+            // The "repeat last key" loop runs with play_depth == 0 and re-enters
+            // process_record_user, so leaving it on would flood a fresh recording.
+            repeat_loop_active = false;
             if (macro_state == ST_RECORDING) {
                 stop_recording();
             } else if (macro_state == ST_ARMED) {
@@ -351,14 +370,19 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     if (slot >= 0) {
         if (record->event.pressed) {
             stop_hold_loop();
-            if (play_depth > 0) {                  // press during playback -> interrupt
+            if (macro_state == ST_RECORDING) {
+                // Run the slot live *and* record a call to it. last_macro_slot stays
+                // put, so a later FN2+Enter loops the macro being built.
+                if (play_depth == 0 && macro_len[slot] > 0 && !call_blocked((uint8_t)slot)) {
+                    record_call((uint8_t)slot);            // first: it stamps last_event_time
+                    start_playback((uint8_t)slot, false);
+                }
+            } else if (play_depth > 0) {           // press during playback -> interrupt
                 stop_playback();
                 repeat_loop_active = false;
-            } else if (macro_state == ST_RECORDING) {
-                record_call((uint8_t)slot);        // record a recursive call to that slot
             } else if (macro_state == ST_ARMED) {
                 start_recording((uint8_t)slot);
-            } else if (macro_state == ST_IDLE && macro_len[slot] > 0) {
+            } else if (macro_len[slot] > 0) {      // ST_IDLE
                 last_macro_slot = slot;
                 start_playback((uint8_t)slot, false);
             }
@@ -366,15 +390,12 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
         return false;
     }
 
-    // A normal key press becomes the new "last action", so FN2+Enter goes back to
-    // repeating that key instead of staying stuck on the last played macro slot.
-    // is_recordable() conveniently excludes layer keys (holding FN2 to reach Enter
-    // won't reset this) and our own macro/toggle keycodes.
+    // A normal key press becomes the new "last action" for FN2+Enter. is_recordable()
+    // excludes layer keys, so holding FN2 to reach Enter doesn't reset this.
     if (record->event.pressed && is_recordable(keycode, record)) {
         last_macro_slot = -1;
     }
 
-    // capture live keystrokes while recording
     if (macro_state == ST_RECORDING && is_recordable(keycode, record)) {
         record_event(keycode, record->event.pressed);
         return true;  // also type the key live
@@ -409,11 +430,12 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
             return false;
         case REPEAT_LOOP:
             if (record->event.pressed) {
+                if (macro_state != ST_IDLE) return false;  // see the header comment
                 stop_hold_loop();  // mutually exclusive with the hold loop
                 repeat_loop_active = !repeat_loop_active;
                 if (repeat_loop_active) {
                     if (last_macro_slot >= 0 && macro_len[last_macro_slot] > 0) {
-                        start_playback((uint8_t)last_macro_slot, true);  // loop the macro
+                        start_playback((uint8_t)last_macro_slot, true);
                     }
                     // else: "repeat last key" handled in matrix_scan_user
                 } else {
@@ -442,11 +464,10 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     return true;
 }
 
-// Keep our custom macro/toggle keycodes out of the Repeat Key memory, so the
-// spam loop repeats the last "real" key pressed instead of the toggle itself.
+// Keep our own keycodes out of the Repeat Key memory, so the loops repeat the last
+// "real" key instead of the toggle itself.
 bool remember_last_key_user(uint16_t keycode, keyrecord_t *record, uint8_t *remembered_mods) {
-    // While a loop is running, keep the target locked to the key pressed before it
-    // started — don't let keys tapped during the loop overwrite the repeat/hold target.
+    // While a loop runs, keep its target locked to the key pressed before it started.
     if (repeat_loop_active || hold_loop_active) return false;
     if (keycode == DREC || slot_index(keycode) >= 0) return false;
     switch (keycode) {
@@ -459,10 +480,9 @@ bool remember_last_key_user(uint16_t keycode, keyrecord_t *record, uint8_t *reme
     return true;
 }
 
-// When a macro or keep-alive loop is active during USB host suspension,
-// send a remote wakeup so the host wakes up and receives the key output.
-// Without this, Keychron's usb_remote_wakeup() loop (transport.c) never
-// calls matrix_scan_user(), so the macro stalls until a physical key is pressed.
+// Wake the host when a loop or macro runs while USB is suspended. Without this,
+// Keychron's usb_remote_wakeup() loop (transport.c) never calls matrix_scan_user(),
+// so playback stalls until a physical key is pressed.
 #if defined(PROTOCOL_CHIBIOS) && defined(LK_WIRELESS_ENABLE)
 void suspend_power_down_user(void) {
     static uint32_t wakeup_timer = 0;
@@ -479,62 +499,71 @@ void suspend_power_down_user(void) {
 extern uint8_t per_key_rgb_type;
 
 void matrix_scan_user(void) {
-    // Non-blocking macro playback engine. Runs one event per elapsed wait so the
-    // matrix keeps being scanned between events and playback stays interruptible.
+    // One event per elapsed wait, so the matrix keeps scanning and playback stays
+    // interruptible.
     if (play_depth > 0) {
         lpm_timer_reset();
         if (timer_elapsed32(play_timer) >= play_wait) {
             play_frame_t *fr = &play_stack[play_depth - 1];
             uint8_t s = fr->slot;
-            if (fr->pos >= macro_len[s]) {         // current frame finished -> pop
+            if (fr->pos >= macro_len[s]) {         // frame finished -> pop
                 play_depth--;
-                if (play_depth == 0) {             // whole macro finished
+                if (play_depth == 0) {
                     if (play_loop) {
                         play_stack[0].slot = play_root;
                         play_stack[0].pos  = 0;
                         play_depth         = 1;
-                        // trailing gap before looping, based on the last slot that typed
-                        uint8_t ls = play_last_key_slot;
-                        play_wait  = macro_realdelay[ls] ? macro_trail[ls] : MACRO_NODELAY_MS;
+                        play_wait          = MACRO_NODELAY_MS;
                     } else {
                         stop_playback();
                     }
-                } else {                           // resumed the caller
-                    play_wait = MACRO_NODELAY_MS;
+                } else {
+                    // A call's own pause is spent here, after its macro ran.
+                    play_frame_t  *pf   = &play_stack[play_depth - 1];
+                    macro_event_t *call = &macro_store[pf->slot][pf->pos - 1];
+                    play_wait = macro_realdelay[pf->slot] ? call->delay_ms : MACRO_NODELAY_MS;
                 }
-                play_timer = timer_read32();
             } else {
                 macro_event_t *e = &macro_store[s][fr->pos];
+                fr->pos++;
+                bool called = false;
                 if (e->type == EV_CALL) {
                     uint8_t target = (uint8_t)e->keycode;
-                    fr->pos++;                     // advance past the call in this frame
-                    if (play_depth < MACRO_PLAY_STACK_DEPTH && macro_len[target] > 0) {
+                    if (play_depth < MACRO_PLAY_STACK_DEPTH && macro_len[target] > 0 &&
+                        !call_blocked(target)) {
                         play_stack[play_depth].slot = target;
                         play_stack[play_depth].pos  = 0;
                         play_depth++;
-                    }                              // else: depth cap / empty target -> skip
-                    play_wait = MACRO_NODELAY_MS;
+                        called = true;             // its delay is spent on the way back
+                    }                              // else: depth cap / empty / recording -> skip
+                } else if (e->pressed) {
+                    register_code16(e->keycode);
+                    bool found = false;
+                    for (uint8_t h = 0; h < play_nheld; h++) {
+                        if (play_held[h] == e->keycode) { found = true; break; }
+                    }
+                    if (!found) {
+                        if (play_nheld < MACRO_PLAY_HELD_MAX) play_held[play_nheld++] = e->keycode;
+                        else                                  play_held_overflow = true;
+                    }
                 } else {
-                    if (e->pressed) register_code16(e->keycode);
-                    else            unregister_code16(e->keycode);
-                    play_last_key_slot = s;
-                    fr->pos++;
-                    play_wait = (fr->pos < macro_len[s])
-                                ? (macro_realdelay[s] ? macro_store[s][fr->pos].delay_ms : MACRO_NODELAY_MS)
-                                : MACRO_NODELAY_MS;
+                    unregister_code16(e->keycode);
+                    for (uint8_t h = 0; h < play_nheld; h++) {
+                        if (play_held[h] == e->keycode) { play_held[h] = play_held[--play_nheld]; break; }
+                    }
                 }
-                play_timer = timer_read32();
+                play_wait = (called || !macro_realdelay[s]) ? MACRO_NODELAY_MS : e->delay_ms;
             }
+            play_timer = timer_read32();
         }
     }
 
     static uint32_t repeat_timer = 0;
-    // Legacy "repeat last key" only when the loop key isn't driving a macro.
+    // "Repeat last key" only when the loop key isn't driving a macro.
     if (repeat_loop_active && last_macro_slot < 0) {
         lpm_timer_reset();
         if (timer_elapsed32(repeat_timer) >= 50) {
             repeat_timer = timer_read32();
-            // Re-fire the last pressed key via the QMK Repeat Key feature.
             keyevent_t press = MAKE_KEYEVENT(0, 0, true);
             repeat_key_invoke(&press);
             keyevent_t release = MAKE_KEYEVENT(0, 0, false);
@@ -583,15 +612,13 @@ void matrix_scan_user(void) {
 #define MACRO_TAB_LED 14
 static const uint8_t macro_slot_led[MACRO_SLOT_COUNT] = {15, 16, 17, 18, 19, 20, 21, 22, 23, 24};
 
-// General macro-status colors (one place to retune them).
 #define MACRO_C_ACTIVE   0x00, 0xFF, 0x00   // green   — executing slot / active loop toggle
 #define MACRO_C_PARENT   0xFF, 0xFF, 0x00   // yellow  — caller still on the play stack
 #define MACRO_C_RECORD   0xFF, 0x00, 0x00   // red     — slot being recorded into
 #define MACRO_C_ARMED_RD 0xFF, 0x00, 0xFF   // magenta — armed, real-delay mode
 #define MACRO_C_ARMED_ND 0xFF, 0xFF, 0x00   // yellow  — armed, no-delay mode
 
-// Paint a single LED only when it falls in the current render window. Pass NO_LED
-// (or a disabled state via the ternary at the call site) to skip.
+// Paint one LED, but only if it falls in the current render window. NO_LED = skip.
 static void macro_led(uint8_t lo, uint8_t hi, uint8_t idx, uint8_t r, uint8_t g, uint8_t b) {
     if (idx != NO_LED && lo <= idx && idx < hi) rgb_matrix_set_color(idx, r, g, b);
 }
