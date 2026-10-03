@@ -1,0 +1,17 @@
+default:
+  dockerfile: &default_dockerfile
+    - RUN uv tool install qmk
+    - USER root
+    # prettier-ignore
+    - RUN apt-get update && apt-get install -y --no-install-recommends
+            gcc-arm-none-eabi
+            binutils-arm-none-eabi
+            libnewlib-arm-none-eabi
+            dfu-util
+          && rm -rf /var/lib/apt/lists/*
+namespaces:
+  claude:
+    dockerfile:
+      - *default_dockerfile
+      - USER dev
+      - RUN MODULES="claude" ~/dotfiles/setup.sh
