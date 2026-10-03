@@ -17,6 +17,7 @@
 #include QMK_KEYBOARD_H
 #include "keychron_common.h"
 #include "macros/main.h"
+#include "nvm_eeprom_eeconfig_internal.h"  // EECONFIG_SIZE, for the EEPROM budget check
 #ifdef RGB_MATRIX_ENABLE
 #    include "lpm.h"
 #endif
@@ -52,6 +53,20 @@ enum custom_keycodes {
 };
 _Static_assert(HOLD_LOOP <= 0x7E1F, "custom keycodes overflow the QK_KB range (0x7E1F)");
 
+// QK_KB is full, so the persistent slots live in QK_USER (free now that VIA is off).
+enum persistent_slot_keycodes {
+    PSLOT_1 = QK_USER_0,  // FN2+A : persistent (EEPROM) macro slot 1
+    PSLOT_2,              // FN2+S
+    PSLOT_3,              // FN2+D
+    PSLOT_4,              // FN2+F
+    PSLOT_5,              // FN2+G
+    PSLOT_6,              // FN2+H
+    PSLOT_7,              // FN2+J
+    PSLOT_8,              // FN2+K
+    PSLOT_9,              // FN2+L
+    PSLOT_10,             // FN2+Ö : persistent macro slot 10
+};
+
 // clang-format off
 const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     [MAC_BASE] = LAYOUT_iso_68(
@@ -85,7 +100,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     [FN2] = LAYOUT_iso_68(
         KC_TILD,  KC_F1,    KC_F2,    KC_F3,    KC_F4,    KC_F5,    KC_F6,    KC_F7,    KC_F8,    KC_F9,    KC_F10,   KC_F11,   KC_F12,   HOLD_LOOP,          _______,
         DREC,     MSLOT_1,  MSLOT_2,  MSLOT_3,  MSLOT_4,  MSLOT_5,  MSLOT_6,  MSLOT_7,  MSLOT_8,  MSLOT_9,  MSLOT_10, MS_BTN4,  MS_BTN1,                      MS_WHLU,
-        _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  MS_BTN5,  MS_BTN2, REPEAT_LOOP,            MS_WHLD,
+        _______,  PSLOT_1,  PSLOT_2,  PSLOT_3,  PSLOT_4,  PSLOT_5,  PSLOT_6,  PSLOT_7,  PSLOT_8,  PSLOT_9,  PSLOT_10, MS_BTN5,  MS_BTN2, REPEAT_LOOP,            MS_WHLD,
         _______,  _______,  _______,  _______,  _______,  _______,  BAT_LVL,  _______,  _______,  _______,  _______,  _______,            MS_BTN3,  MS_UP,
         RCTRL_LOOP, _______,  _______,                              _______,                                _______,  _______,  _______,  MS_LEFT,  MS_DOWN,  MS_RGHT)
 };
@@ -108,45 +123,82 @@ static uint16_t hold_keycode     = KC_NO;  // key currently held down by the hol
 static uint8_t  hold_mods        = 0;
 
 // ---------------------------------------------------------------------------
-// Custom multi-slot live macro recorder. Storage is RAM-only (lost on power-off).
+// Custom multi-slot live macro recorder with two banks of MACRO_SLOT_COUNT slots:
+// RAM slots (FN2+Q..P, lost on power-off) and persistent EEPROM slots (FN2+A..Ö).
 //
-// FN2+Tab   : idle -> arm (single tap = no delay, double tap = real delays)
-//             recording -> stop; also the escape hatch out of any state
-// FN2+Q..P  : armed -> record into that slot | idle -> play it
-//             recording -> play it live AND record a call to it (compose macros)
+// FN2+Tab   : idle -> arm recording (single tap = no delay, double tap = real delays)
+//             triple tap -> copy mode; recording -> stop and save (no keys = erase)
+//             also the escape hatch out of any state
+// FN2+Q..P  : armed -> record into that RAM slot | idle -> play it
+// FN2+A..Ö  : idle -> play that EEPROM slot (it can't be recorded into, only copied to)
+// any slot  : recording -> play it live AND record a call to it (compose macros)
+//             copy mode -> 1st press picks the source, 2nd the destination; copying
+//             an empty slot clears the destination. This is how EEPROM slots are filled
 //             playing -> interrupt
 // FN2+Enter : loop the last played slot, else "repeat last key". Ignored while
 //             armed or recording (a loop records nothing and, since a call is only
 //             recorded when nothing plays, would swallow every slot press).
 //
-// An event is a key (EV_KEY) or a call into another slot (EV_CALL); playback walks a
-// frame stack, so calls nest and resume their caller. Calls come from composing (see
-// process_record_user) and from overflow: a slot that fills mid-recording calls the
-// next slot and continues there, so one macro can span slots.
+// Each bank is one event pool shared by its slots, so a slot is as long as it needs to
+// be. A slot's events are contiguous: freeing a slot compacts the pool, and new content
+// always goes to the tail, so the slot being recorded grows by appending.
+// An event is a key or a call into another slot (global slot index, so calls are plain
+// references — an EEPROM macro calling a RAM slot plays nothing for it after a reboot).
+// Playback walks a frame stack, so calls nest and resume their caller.
 // Quirk: keys typed while a call plays replay after it, not interleaved.
 // ---------------------------------------------------------------------------
-typedef enum { EV_KEY, EV_CALL } macro_evtype_t;
+#define EVF_PRESSED 0x01
+#define EVF_CALL    0x02
 
-typedef struct {
-    uint16_t keycode;   // EV_KEY: keycode to (un)register; EV_CALL: target slot index
+typedef struct __attribute__((packed)) {
+    uint16_t keycode;   // key: keycode to (un)register; call: target slot (global index)
     uint16_t delay_ms;  // pause that followed this event
-    uint8_t  type;
-    bool     pressed;
+    uint8_t  flags;     // EVF_*
 } macro_event_t;
 
-typedef enum { ST_IDLE, ST_ARMED, ST_RECORDING } macro_state_t;
+typedef struct __attribute__((packed)) {
+    uint16_t off[MACRO_SLOT_COUNT];  // first event in the pool (only valid when len > 0)
+    uint16_t len[MACRO_SLOT_COUNT];
+    uint16_t realdelay;              // bitmask: playback honors real delays?
+    uint16_t used;                   // events in use, all below this index
+} macro_hdr_t;
 
-static macro_event_t macro_store[MACRO_SLOT_COUNT][MACRO_MAX_EVENTS];
-static uint16_t       macro_len[MACRO_SLOT_COUNT];
-static bool           macro_realdelay[MACRO_SLOT_COUNT]; // playback honors real delays?
+#define MACRO_TOTAL_SLOTS (2 * MACRO_SLOT_COUNT)  // global index: RAM 0..9, EEPROM 10..19
+#define MACRO_EE_EVENTS   ((EECONFIG_USER_DATA_SIZE - sizeof(macro_hdr_t)) / sizeof(macro_event_t))
+#define MACRO_REC_RESERVE 16  // pool entries kept free so stop_recording can release held keys
+
+// The EEPROM bank is mirrored in RAM; this struct is its exact on-EEPROM image.
+typedef struct __attribute__((packed)) {
+    macro_hdr_t   hdr;
+    macro_event_t ev[MACRO_EE_EVENTS];
+} macro_ee_image_t;
+_Static_assert(sizeof(macro_ee_image_t) <= EECONFIG_USER_DATA_SIZE, "EEPROM macro image too large");
+_Static_assert(EECONFIG_SIZE <= WEAR_LEVELING_LOGICAL_SIZE, "EECONFIG_USER_DATA_SIZE exceeds the EEPROM");
+_Static_assert(MACRO_RAM_EVENTS <= 0xFFFF && MACRO_EE_EVENTS <= 0xFFFF, "macro pool index overflow");
+
+static macro_hdr_t      ram_hdr;
+static macro_event_t    ram_ev[MACRO_RAM_EVENTS];
+static macro_ee_image_t ee_img;
+
+typedef struct {
+    macro_hdr_t   *hdr;
+    macro_event_t *ev;
+    uint16_t       cap;
+} macro_bank_t;
+
+static const macro_bank_t macro_banks[2] = {
+    {&ram_hdr, ram_ev, MACRO_RAM_EVENTS},
+    {&ee_img.hdr, ee_img.ev, MACRO_EE_EVENTS},
+};
+
+typedef enum { ST_IDLE, ST_ARMED, ST_RECORDING, ST_COPY_SRC, ST_COPY_DST } macro_state_t;
 
 static macro_state_t  macro_state     = ST_IDLE;
 static bool           armed_realdelay = false;
-static uint8_t        active_slot     = 0;               // slot currently being recorded into
-static uint8_t        rec_root_slot   = 0;               // slot the recording started in
-static uint32_t       drec_tap_timer  = 0;               // double-tap detection
+static uint8_t        active_slot     = 0;               // RAM slot currently being recorded into
+static uint8_t        copy_src        = 0;               // copy mode: chosen source slot
+static uint32_t       drec_tap_timer  = 0;               // double/triple-tap detection
 static uint32_t       last_event_time = 0;               // for inter-event delta
-static uint16_t       rec_called_mask = 0;               // slots this recording calls
 static macro_event_t *last_ev         = NULL;            // event awaiting its delay
 
 typedef struct { uint8_t slot; uint16_t pos; } play_frame_t;
@@ -158,6 +210,8 @@ static uint8_t        play_root       = 0;               // slot to restart from
 static bool           play_loop       = false;
 static uint32_t       play_timer      = 0;               // when current step's wait started
 static uint16_t       play_wait       = 0;                // ms to wait before processing top frame
+static uint32_t       play_done_ms    = 0;               // macro time of the finished steps
+static uint32_t       play_total_ms   = 0;               // macro time of a full run (progress bar)
 static int8_t         last_macro_slot = -1;              // last slot played (for FN2+Enter loop)
 
 // Keys playback registered, so teardown releases exactly those (see release_play_held).
@@ -168,15 +222,102 @@ static bool           play_held_overflow = false;
 
 static inline int8_t slot_index(uint16_t keycode) {
     if (keycode >= MSLOT_1 && keycode <= MSLOT_10) return (int8_t)(keycode - MSLOT_1);
+    if (keycode >= PSLOT_1 && keycode <= PSLOT_10) return (int8_t)(MACRO_SLOT_COUNT + keycode - PSLOT_1);
     return -1;
+}
+
+static inline const macro_bank_t *slot_bank(uint8_t s) { return &macro_banks[s / MACRO_SLOT_COUNT]; }
+static inline uint8_t  slot_local(uint8_t s) { return s % MACRO_SLOT_COUNT; }
+static inline bool     slot_is_ee(uint8_t s) { return s >= MACRO_SLOT_COUNT; }
+static inline uint16_t slot_len(uint8_t s) { return slot_bank(s)->hdr->len[slot_local(s)]; }
+
+static inline macro_event_t *slot_ev(uint8_t s, uint16_t pos) {
+    const macro_bank_t *b = slot_bank(s);
+    return &b->ev[b->hdr->off[slot_local(s)] + pos];
+}
+
+static inline bool slot_realdelay(uint8_t s) {
+    return (slot_bank(s)->hdr->realdelay >> slot_local(s)) & 1;
+}
+
+static void set_slot_realdelay(uint8_t s, bool on) {
+    uint16_t bit = (uint16_t)1 << slot_local(s);
+    if (on) slot_bank(s)->hdr->realdelay |= bit;
+    else    slot_bank(s)->hdr->realdelay &= ~bit;
+}
+
+// Free a slot's events and close the gap. Offsets of later slots shift down, so
+// pointers into the pool are stale afterwards (play frames hold slot+pos, not pointers).
+static void slot_clear(uint8_t s) {
+    const macro_bank_t *b = slot_bank(s);
+    macro_hdr_t        *h = b->hdr;
+    uint8_t             l = slot_local(s);
+    uint16_t len = h->len[l], off = h->off[l];
+    h->len[l] = 0;
+    h->off[l] = 0;
+    if (len == 0) return;
+    memmove(&b->ev[off], &b->ev[off + len], (h->used - off - len) * sizeof(macro_event_t));
+    for (uint8_t i = 0; i < MACRO_SLOT_COUNT; i++) {
+        if (h->len[i] && h->off[i] > off) h->off[i] -= len;
+    }
+    h->used -= len;
+}
+
+// In chunks: eeprom_update_block() puts a copy of the whole range on the (2 KB) stack.
+// Unchanged chunks are skipped there, so only what moved gets written.
+#define MACRO_EE_CHUNK 32
+static void ee_save(void) {
+    const uint8_t *img = (const uint8_t *)&ee_img;
+    uint32_t       n   = sizeof(macro_hdr_t) + ee_img.hdr.used * sizeof(macro_event_t);
+    for (uint32_t o = 0; o < n; o += MACRO_EE_CHUNK) {
+        eeconfig_update_user_datablock(img + o, o, MIN(n - o, (uint32_t)MACRO_EE_CHUNK));
+    }
+}
+
+static void ee_load(void) {
+    eeconfig_read_user_datablock(&ee_img, 0, sizeof(ee_img));
+    macro_hdr_t *h  = &ee_img.hdr;
+    bool         ok = h->used <= MACRO_EE_EVENTS;
+    for (uint8_t i = 0; i < MACRO_SLOT_COUNT; i++) {
+        if (h->len[i] && (uint32_t)h->off[i] + h->len[i] > h->used) ok = false;
+    }
+    if (!ok) memset(&ee_img, 0, sizeof(ee_img));
+}
+
+// Copy src's events to the tail of dst's bank (an empty src clears dst). False = no
+// room; dst is left untouched then.
+static bool copy_slot(uint8_t src, uint8_t dst) {
+    if (src == dst) return true;
+    const macro_bank_t *db = slot_bank(dst);
+    uint8_t             dl = slot_local(dst);
+    uint16_t            n  = slot_len(src);
+    if ((uint32_t)db->hdr->used - db->hdr->len[dl] + n > db->cap) return false;
+    bool rd = slot_realdelay(src);
+    slot_clear(dst);
+    if (n) {
+        // Resolve src only now: clearing dst may have compacted it (same bank). It sits
+        // below the tail, so the ranges never overlap.
+        memcpy(&db->ev[db->hdr->used], slot_ev(src, 0), n * sizeof(macro_event_t));
+        db->hdr->off[dl] = db->hdr->used;
+        db->hdr->len[dl] = n;
+        db->hdr->used += n;
+    }
+    set_slot_realdelay(dst, rd);
+    if (slot_is_ee(dst)) ee_save();
+    return true;
 }
 
 static uint16_t clamp_u16(uint32_t v) { return v > 0xFFFF ? 0xFFFF : (uint16_t)v; }
 
-// Slots rec_root_slot..active_slot are still being written, so playing one would feed
-// the recording into itself. Also checked per EV_CALL: a callee may call back in.
+// The slot being recorded is still being written, so playing it would feed the
+// recording into itself. Also checked per call: a callee may call back in.
 static inline bool call_blocked(uint8_t slot) {
-    return macro_state == ST_RECORDING && slot >= rec_root_slot && slot <= active_slot;
+    return macro_state == ST_RECORDING && slot == active_slot;
+}
+
+// Whether playback would enter this call (ignoring the stack depth cap).
+static inline bool call_runs(uint8_t target) {
+    return target < MACRO_TOTAL_SLOTS && slot_len(target) > 0 && !call_blocked(target);
 }
 
 static bool is_recordable(uint16_t keycode, keyrecord_t *record) {
@@ -208,93 +349,97 @@ static void close_interval(void) {
 static void stop_recording(void) {
     if (macro_state != ST_RECORDING) return;
     close_interval();
+    last_ev = NULL;
     uint8_t s = active_slot;
 
-    // Release keys still held at stop, so playback never sticks one down. Scans the
-    // whole chain to catch presses from before an overflow. close_interval() above put
-    // the pause on the last real event, so a key held until the stop key stays held
-    // that long on playback.
-    uint16_t held[MACRO_MAX_EVENTS];
+    // Release keys still held at stop, so playback never sticks one down. close_interval()
+    // above put the pause on the last real event, so a key held until the stop key stays
+    // held that long on playback. Appends use the pool space append_event() kept free.
+    uint16_t held[MACRO_REC_RESERVE];
     uint8_t  nheld = 0;
-    for (uint8_t cs = rec_root_slot; cs <= s; cs++) {
-        for (uint16_t i = 0; i < macro_len[cs]; i++) {
-            if (macro_store[cs][i].type != EV_KEY) continue;
-            uint16_t kc = macro_store[cs][i].keycode;
-            if (macro_store[cs][i].pressed) {
-                bool found = false;
-                for (uint8_t h = 0; h < nheld; h++) if (held[h] == kc) { found = true; break; }
-                if (!found && nheld < MACRO_MAX_EVENTS) held[nheld++] = kc;
-            } else {
-                for (uint8_t h = 0; h < nheld; h++) if (held[h] == kc) { held[h] = held[--nheld]; break; }
-            }
+    for (uint16_t i = 0; i < ram_hdr.len[s]; i++) {
+        macro_event_t *e = slot_ev(s, i);
+        if (e->flags & EVF_CALL) continue;
+        if (e->flags & EVF_PRESSED) {
+            bool found = false;
+            for (uint8_t h = 0; h < nheld; h++) if (held[h] == e->keycode) { found = true; break; }
+            if (!found && nheld < MACRO_REC_RESERVE) held[nheld++] = e->keycode;
+        } else {
+            for (uint8_t h = 0; h < nheld; h++) if (held[h] == e->keycode) { held[h] = held[--nheld]; break; }
         }
     }
-    for (uint8_t h = 0; h < nheld && macro_len[s] < MACRO_MAX_EVENTS; h++) {
-        macro_store[s][macro_len[s]].keycode  = held[h];
-        macro_store[s][macro_len[s]].delay_ms = 0;
-        macro_store[s][macro_len[s]].type     = EV_KEY;
-        macro_store[s][macro_len[s]].pressed  = false;
-        macro_len[s]++;
+    for (uint8_t h = 0; h < nheld && ram_hdr.used < MACRO_RAM_EVENTS; h++) {
+        macro_event_t *e = &ram_ev[ram_hdr.used++];
+        e->keycode       = held[h];
+        e->delay_ms      = 0;
+        e->flags         = 0;
+        ram_hdr.len[s]++;
     }
+    if (ram_hdr.len[s] == 0) ram_hdr.off[s] = 0;  // nothing typed -> slot erased
     macro_state = ST_IDLE;
 }
 
-// Keep one entry free per slot for the overflow call. False = nowhere left to chain,
-// so the caller must stop recording.
-static bool ensure_record_room(void) {
-    uint16_t *len = &macro_len[active_slot];
-    if (*len < MACRO_MAX_EVENTS - 1) return true;       // room for one more event
-    if (active_slot + 1 >= MACRO_SLOT_COUNT) return false;
-    uint8_t next = active_slot + 1;
-    // Stop rather than chain over a slot this recording calls: that call would end up
-    // pointing at our own continuation, and wiping a slot mid-playback pops its frame.
-    if (rec_called_mask & ((uint16_t)1 << next)) return false;
-    macro_store[active_slot][*len].keycode  = next;     // chain call at the reserved entry
-    macro_store[active_slot][*len].delay_ms = 0;
-    macro_store[active_slot][*len].type     = EV_CALL;
-    macro_store[active_slot][*len].pressed  = false;
-    (*len)++;
-    active_slot           = next;
-    macro_len[next]       = 0;
-    macro_realdelay[next] = armed_realdelay;
-    return true;
-}
-
-static macro_event_t *append_event(uint8_t type) {
+// The recorded slot sits at the pool tail, so an event is one more entry there. A full
+// pool ends the recording.
+static macro_event_t *append_event(uint8_t flags) {
     close_interval();
-    if (!ensure_record_room()) { stop_recording(); return NULL; }
-    macro_event_t *e = &macro_store[active_slot][macro_len[active_slot]++];
+    if (ram_hdr.used + MACRO_REC_RESERVE >= MACRO_RAM_EVENTS) { stop_recording(); return NULL; }
+    macro_event_t *e = &ram_ev[ram_hdr.used++];
+    ram_hdr.len[active_slot]++;
     e->delay_ms      = 0;
-    e->type          = type;
-    e->pressed       = false;
+    e->flags         = flags;
     last_ev          = e;
     last_event_time  = timer_read32();
     return e;
 }
 
 static void record_call(uint8_t target) {
-    macro_event_t *e = append_event(EV_CALL);
+    macro_event_t *e = append_event(EVF_CALL);
     if (!e) return;
-    e->keycode       = target;
-    rec_called_mask |= (uint16_t)1 << target;
+    e->keycode = target;
 }
 
 static void record_event(uint16_t keycode, bool pressed) {
-    macro_event_t *e = append_event(EV_KEY);
+    macro_event_t *e = append_event(pressed ? EVF_PRESSED : 0);
     if (!e) return;
     e->keycode = keycode;
-    e->pressed = pressed;
 }
 
 static void start_recording(uint8_t slot) {
-    active_slot           = slot;
-    rec_root_slot         = slot;
-    macro_len[slot]       = 0;
-    macro_realdelay[slot] = armed_realdelay;
-    rec_called_mask       = 0;
-    last_ev               = NULL;
-    last_event_time       = timer_read32();
-    macro_state           = ST_RECORDING;
+    slot_clear(slot);
+    ram_hdr.off[slot] = ram_hdr.used;
+    set_slot_realdelay(slot, armed_realdelay);
+    active_slot     = slot;
+    last_ev         = NULL;
+    last_event_time = timer_read32();
+    macro_state     = ST_RECORDING;
+}
+
+// Macro time of one run of a slot, mirroring the waits matrix_scan_user schedules:
+// a key waits w (real delay or MACRO_NODELAY_MS); a call waits MACRO_NODELAY_MS, runs
+// the callee, then waits its own w. Memoized per slot, since calls may fan out; a slot
+// that (indirectly) calls itself counts as 0 there, where playback would run until
+// the stack depth cap.
+static uint32_t dur_memo[MACRO_TOTAL_SLOTS];
+static uint8_t  dur_state[MACRO_TOTAL_SLOTS];  // 0 = unknown, 1 = computing, 2 = done
+
+static uint32_t slot_duration(uint8_t s) {
+    if (dur_state[s] == 2) return dur_memo[s];
+    if (dur_state[s] == 1) return 0;
+    dur_state[s] = 1;
+    bool     rd    = slot_realdelay(s);
+    uint32_t total = 0;
+    for (uint16_t i = 0; i < slot_len(s); i++) {
+        macro_event_t *e = slot_ev(s, i);
+        uint16_t       w = rd ? e->delay_ms : MACRO_NODELAY_MS;
+        if ((e->flags & EVF_CALL) && call_runs((uint8_t)e->keycode)) {
+            total += MACRO_NODELAY_MS + slot_duration((uint8_t)e->keycode);
+        }
+        total += w;
+    }
+    dur_memo[s]  = total;
+    dur_state[s] = 2;
+    return total;
 }
 
 // Not clear_keyboard(): that would also drop keys and mods the user physically holds
@@ -307,7 +452,7 @@ static void release_play_held(void) {
 }
 
 static void start_playback(uint8_t slot, bool loop) {
-    if (macro_len[slot] == 0) return;
+    if (slot_len(slot) == 0) return;
     if (play_depth > 0) release_play_held();             // restarting over a live playback
     play_stack[0].slot = slot;
     play_stack[0].pos  = 0;
@@ -316,6 +461,9 @@ static void start_playback(uint8_t slot, bool loop) {
     play_loop          = loop;
     play_wait          = 0;
     play_timer         = timer_read32();
+    play_done_ms       = 0;
+    memset(dur_state, 0, sizeof(dur_state));
+    play_total_ms      = slot_duration(slot);
 }
 
 static void stop_playback(void) {
@@ -337,6 +485,15 @@ static void stop_hold_loop(void) {
     hold_loop_active = false;
 }
 
+void keyboard_post_init_user(void) {
+    ee_load();
+}
+
+// EEPROM reset (also on first boot): the datablock was just zeroed, drop the mirror too.
+void eeconfig_init_user(void) {
+    memset(&ee_img, 0, sizeof(ee_img));
+}
+
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     int8_t slot = slot_index(keycode);
 
@@ -350,11 +507,15 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
             if (macro_state == ST_RECORDING) {
                 stop_recording();
             } else if (macro_state == ST_ARMED) {
-                if (timer_elapsed32(drec_tap_timer) < DREC_TAP_TERM) {
+                if (timer_elapsed32(drec_tap_timer) >= DREC_TAP_TERM) {
+                    macro_state = ST_IDLE;         // settled press while armed -> abort
+                } else if (!armed_realdelay) {
                     armed_realdelay = true;        // quick double tap -> measure real delays
                 } else {
-                    macro_state = ST_IDLE;         // settled press while armed -> abort
+                    macro_state = ST_COPY_SRC;     // quick triple tap -> copy mode
                 }
+            } else if (macro_state == ST_COPY_SRC || macro_state == ST_COPY_DST) {
+                macro_state = ST_IDLE;             // abort copy
             } else {
                 armed_realdelay = false;           // single tap -> arm (no delay)
                 macro_state     = ST_ARMED;
@@ -370,7 +531,7 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
             if (macro_state == ST_RECORDING) {
                 // Run the slot live *and* record a call to it. last_macro_slot stays
                 // put, so a later FN2+Enter loops the macro being built.
-                if (play_depth == 0 && macro_len[slot] > 0 && !call_blocked((uint8_t)slot)) {
+                if (play_depth == 0 && call_runs((uint8_t)slot)) {
                     record_call((uint8_t)slot);            // first: it stamps last_event_time
                     start_playback((uint8_t)slot, false);
                 }
@@ -378,8 +539,14 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
                 stop_playback();
                 repeat_loop_active = false;
             } else if (macro_state == ST_ARMED) {
-                start_recording((uint8_t)slot);
-            } else if (macro_len[slot] > 0) {      // ST_IDLE
+                if (!slot_is_ee((uint8_t)slot)) start_recording((uint8_t)slot);  // EEPROM: copy only
+            } else if (macro_state == ST_COPY_SRC) {
+                copy_src    = (uint8_t)slot;
+                macro_state = ST_COPY_DST;
+            } else if (macro_state == ST_COPY_DST) {
+                copy_slot(copy_src, (uint8_t)slot);
+                macro_state = ST_IDLE;
+            } else if (slot_len((uint8_t)slot) > 0) {  // ST_IDLE
                 last_macro_slot = slot;
                 start_playback((uint8_t)slot, false);
             }
@@ -431,7 +598,7 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
                 stop_hold_loop();  // mutually exclusive with the hold loop
                 repeat_loop_active = !repeat_loop_active;
                 if (repeat_loop_active) {
-                    if (last_macro_slot >= 0 && macro_len[last_macro_slot] > 0) {
+                    if (last_macro_slot >= 0 && slot_len((uint8_t)last_macro_slot) > 0) {
                         start_playback((uint8_t)last_macro_slot, true);
                     }
                     // else: "repeat last key" handled in matrix_scan_user
@@ -499,9 +666,10 @@ void matrix_scan_user(void) {
     if (play_depth > 0) {
         lpm_timer_reset();
         if (timer_elapsed32(play_timer) >= play_wait) {
+            play_done_ms += play_wait;
             play_frame_t *fr = &play_stack[play_depth - 1];
             uint8_t s = fr->slot;
-            if (fr->pos >= macro_len[s]) {         // frame finished -> pop
+            if (fr->pos >= slot_len(s)) {          // frame finished -> pop
                 play_depth--;
                 if (play_depth == 0) {
                     if (play_loop) {
@@ -509,29 +677,29 @@ void matrix_scan_user(void) {
                         play_stack[0].pos  = 0;
                         play_depth         = 1;
                         play_wait          = MACRO_NODELAY_MS;
+                        play_done_ms       = 0;
                     } else {
                         stop_playback();
                     }
                 } else {
                     // A call's own pause is spent here, after its macro ran.
                     play_frame_t  *pf   = &play_stack[play_depth - 1];
-                    macro_event_t *call = &macro_store[pf->slot][pf->pos - 1];
-                    play_wait = macro_realdelay[pf->slot] ? call->delay_ms : MACRO_NODELAY_MS;
+                    macro_event_t *call = slot_ev(pf->slot, pf->pos - 1);
+                    play_wait = slot_realdelay(pf->slot) ? call->delay_ms : MACRO_NODELAY_MS;
                 }
             } else {
-                macro_event_t *e = &macro_store[s][fr->pos];
+                macro_event_t *e = slot_ev(s, fr->pos);
                 fr->pos++;
                 bool called = false;
-                if (e->type == EV_CALL) {
+                if (e->flags & EVF_CALL) {
                     uint8_t target = (uint8_t)e->keycode;
-                    if (play_depth < MACRO_PLAY_STACK_DEPTH && macro_len[target] > 0 &&
-                        !call_blocked(target)) {
+                    if (play_depth < MACRO_PLAY_STACK_DEPTH && call_runs(target)) {
                         play_stack[play_depth].slot = target;
                         play_stack[play_depth].pos  = 0;
                         play_depth++;
                         called = true;             // its delay is spent on the way back
                     }                              // else: depth cap / empty / recording -> skip
-                } else if (e->pressed) {
+                } else if (e->flags & EVF_PRESSED) {
                     register_code16(e->keycode);
                     bool found = false;
                     for (uint8_t h = 0; h < play_nheld; h++) {
@@ -547,7 +715,7 @@ void matrix_scan_user(void) {
                         if (play_held[h] == e->keycode) { play_held[h] = play_held[--play_nheld]; break; }
                     }
                 }
-                play_wait = (called || !macro_realdelay[s]) ? MACRO_NODELAY_MS : e->delay_ms;
+                play_wait = (called || !slot_realdelay(s)) ? MACRO_NODELAY_MS : e->delay_ms;
             }
             play_timer = timer_read32();
         }
@@ -602,19 +770,48 @@ void matrix_scan_user(void) {
     }
 }
 
-// LED indices for the macro keys (matrix row 1: Tab, Q, W, E, R, T, Y, U, I, O, P)
+// LED indices: slot keys by global slot index (Q..P = RAM, A..Ö = EEPROM), and the
+// two 10-key bars (number row 1..0, bottom letter row Y..-).
 #define MACRO_TAB_LED 14
-static const uint8_t macro_slot_led[MACRO_SLOT_COUNT] = {15, 16, 17, 18, 19, 20, 21, 22, 23, 24};
+static const uint8_t macro_slot_led[MACRO_TOTAL_SLOTS] = {
+    15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+    30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+};
+static const uint8_t macro_bar_top[10]    = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+static const uint8_t macro_bar_bottom[10] = {45, 46, 47, 48, 49, 50, 51, 52, 53, 54};
 
 #define MACRO_C_ACTIVE   0x00, 0xFF, 0x00   // green   — executing slot / active loop toggle
 #define MACRO_C_PARENT   0xFF, 0xFF, 0x00   // yellow  — caller still on the play stack
 #define MACRO_C_RECORD   0xFF, 0x00, 0x00   // red     — slot being recorded into
 #define MACRO_C_ARMED_RD 0xFF, 0x00, 0xFF   // magenta — armed, real-delay mode
 #define MACRO_C_ARMED_ND 0xFF, 0xFF, 0x00   // yellow  — armed, no-delay mode
+#define MACRO_C_COPY     0x00, 0x00, 0xFF   // blue    — copy mode (Tab)
+#define MACRO_C_COPY_SRC 0xFF, 0xFF, 0xFF   // white   — chosen copy source
+#define MACRO_C_EMPTY    0x00, 0xFF, 0x00   // green   — selectable empty slot
+#define MACRO_C_USED     0xFF, 0xFF, 0x00   // yellow  — selectable used slot
+#define MACRO_C_LOCKED   0xFF, 0x00, 0x00   // red     — not selectable (EEPROM while armed)
+#define MACRO_C_PROGRESS 0xFF, 0xFF, 0xFF   // white   — playback progress
+#define MACRO_C_RAM_CAP  0x00, 0xFF, 0xFF   // cyan    — RAM pool fill
+#define MACRO_C_EE_CAP   0xFF, 0x00, 0xFF   // magenta — EEPROM pool fill
 
 // Paint one LED, but only if it falls in the current render window. NO_LED = skip.
 static void macro_led(uint8_t lo, uint8_t hi, uint8_t idx, uint8_t r, uint8_t g, uint8_t b) {
     if (idx != NO_LED && lo <= idx && idx < hi) rgb_matrix_set_color(idx, r, g, b);
+}
+
+// num/den as a 10-LED bar: full LEDs lit, the partial one dimmed to its share, rest off.
+static void macro_bar(uint8_t lo, uint8_t hi, const uint8_t leds[10], uint32_t num, uint32_t den,
+                      uint8_t r, uint8_t g, uint8_t b) {
+    uint32_t fill = den ? (uint32_t)MIN((uint64_t)num * 10 * 255 / den, 10 * 255) : 0;
+    for (uint8_t i = 0; i < 10; i++) {
+        uint8_t v = fill > 255 ? 255 : (uint8_t)fill;
+        fill -= v;
+        macro_led(lo, hi, leds[i], r * v / 255, g * v / 255, b * v / 255);
+    }
+}
+
+static uint32_t play_elapsed_ms(void) {
+    return play_done_ms + MIN(timer_elapsed32(play_timer), (uint32_t)play_wait);
 }
 
 bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
@@ -623,20 +820,38 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
     macro_led(led_min, led_max, repeat_loop_active ? 27 : NO_LED, MACRO_C_ACTIVE);
     macro_led(led_min, led_max, hold_loop_active   ? 13 : NO_LED, MACRO_C_ACTIVE);
 
-    // Armed: Tab key — magenta for real-delay, yellow for no-delay.
-    if (macro_state == ST_ARMED) {
-        if (armed_realdelay) macro_led(led_min, led_max, MACRO_TAB_LED, MACRO_C_ARMED_RD);
-        else                 macro_led(led_min, led_max, MACRO_TAB_LED, MACRO_C_ARMED_ND);
+    // Slot selection (armed / copy): slot fill state, plus both pools' capacity bars.
+    bool armed   = macro_state == ST_ARMED;
+    bool copying = macro_state == ST_COPY_SRC || macro_state == ST_COPY_DST;
+    if (armed || copying) {
+        if (armed && armed_realdelay) macro_led(led_min, led_max, MACRO_TAB_LED, MACRO_C_ARMED_RD);
+        else if (armed)               macro_led(led_min, led_max, MACRO_TAB_LED, MACRO_C_ARMED_ND);
+        else                          macro_led(led_min, led_max, MACRO_TAB_LED, MACRO_C_COPY);
+        for (uint8_t s = 0; s < MACRO_TOTAL_SLOTS; s++) {
+            uint8_t led = macro_slot_led[s];
+            if (macro_state == ST_COPY_DST && s == copy_src) macro_led(led_min, led_max, led, MACRO_C_COPY_SRC);
+            else if (armed && slot_is_ee(s))                 macro_led(led_min, led_max, led, MACRO_C_LOCKED);
+            else if (slot_len(s) > 0)                        macro_led(led_min, led_max, led, MACRO_C_USED);
+            else                                             macro_led(led_min, led_max, led, MACRO_C_EMPTY);
+        }
+        macro_bar(led_min, led_max, macro_bar_top, ram_hdr.used, MACRO_RAM_EVENTS, MACRO_C_RAM_CAP);
+        macro_bar(led_min, led_max, macro_bar_bottom, ee_img.hdr.used, MACRO_EE_EVENTS, MACRO_C_EE_CAP);
     }
 
-    // Recording: the slot currently being written glows red.
+    // Recording: the slot currently being written glows red; the number row shows how
+    // full the RAM pool is (unless a composed call is playing, see below).
     if (macro_state == ST_RECORDING) {
         macro_led(led_min, led_max, macro_slot_led[active_slot], MACRO_C_RECORD);
+        if (play_depth == 0) {
+            macro_bar(led_min, led_max, macro_bar_top, ram_hdr.used, MACRO_RAM_EVENTS, MACRO_C_RAM_CAP);
+        }
     }
 
-    // Playing: the call stack — callers yellow, the executing (top) slot green.
-    // Green is written last so it wins when a slot appears at multiple depths.
+    // Playing: progress on the number row; the call stack — callers yellow, the
+    // executing (top) slot green. Green is written last so it wins when a slot appears
+    // at multiple depths.
     if (play_depth > 0) {
+        macro_bar(led_min, led_max, macro_bar_top, play_elapsed_ms(), play_total_ms, MACRO_C_PROGRESS);
         for (uint8_t i = 0; i + 1 < play_depth; i++) {
             macro_led(led_min, led_max, macro_slot_led[play_stack[i].slot], MACRO_C_PARENT);
         }
