@@ -19,7 +19,6 @@
 #include "macros/main.h"
 #ifdef RGB_MATRIX_ENABLE
 #    include "lpm.h"
-#    include "keychron_rgb_type.h"
 #endif
 #if defined(PROTOCOL_CHIBIOS) && defined(LK_WIRELESS_ENABLE)
 #    include <usb_main.h>
@@ -33,9 +32,7 @@ enum layers {
     FN2,
 };
 
-// Base these in Keychron's QK_KB custom range (NEW_SAFE_RANGE), not QK_USER/SAFE_RANGE,
-// so Vial's customKeycodes[] (indexed from QK_KB_0) can give them friendly labels.
-// The order here must match the appended entries in vial.json.
+// Based in Keychron's QK_KB custom range (NEW_SAFE_RANGE), after Keychron's own keycodes.
 enum custom_keycodes {
     M0 = NEW_SAFE_RANGE,
     RCTRL_LOOP,
@@ -496,8 +493,6 @@ void suspend_power_down_user(void) {
 #endif
 
 #ifdef RGB_MATRIX_ENABLE
-extern uint8_t per_key_rgb_type;
-
 void matrix_scan_user(void) {
     // One event per elapsed wait, so the matrix keeps scanning and playback stays
     // interruptible.
@@ -600,8 +595,7 @@ void matrix_scan_user(void) {
         initialized    = true;
         last_usb_state = usb_now;
         if (usb_now) {
-            per_key_rgb_type = PER_KEY_RGB_SOLID;
-            rgb_matrix_mode_noeeprom(RGB_MATRIX_CUSTOM_PER_KEY_RGB);
+            rgb_matrix_mode_noeeprom(RGB_MATRIX_CUSTOM_GRADIENT_X);
         } else {
             rgb_matrix_mode_noeeprom(RGB_MATRIX_SOLID_REACTIVE_MULTIWIDE);
         }

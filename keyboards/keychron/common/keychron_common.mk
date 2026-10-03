@@ -23,7 +23,9 @@ include $(KEYCHRON_COMMON_DIR)/debounce/debounce.mk
 endif
 
 include $(KEYCHRON_COMMON_DIR)/language/language.mk
+ifneq ($(strip $(SNAP_CLICK_ENABLE)), no)
 include $(KEYCHRON_COMMON_DIR)/snap_click/snap_click.mk
+endif
 
 ifeq ($(strip $(KEYCHRON_RGB_ENABLE)), yes)
 ifeq ($(strip $(RGB_MATRIX_ENABLE)), yes)

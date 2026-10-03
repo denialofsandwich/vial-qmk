@@ -2,15 +2,6 @@
 
 #pragma once
 
-#define VIAL_KEYBOARD_UID {0x93, 0xE1, 0xE6, 0xFA, 0x10, 0xDA, 0xF4, 0x70}
-
-#define VIAL_UNLOCK_COMBO_ROWS { 0, 1 }
-#define VIAL_UNLOCK_COMBO_COLS { 0, 13 }
-
-// Keep QK_REP but drop the customizable alt-repeat (QK_AREP) table, freeing its
-// 96-byte Vial EEPROM allocation for recorded macros.
-#define NO_ALT_REPEAT_KEY
-
 // Custom multi-slot live macro recorder (see keymap.c)
 #define MACRO_SLOT_COUNT 10
 #define MACRO_MAX_EVENTS 128   // ~64 keystrokes (press+release) per slot
