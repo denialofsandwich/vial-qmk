@@ -442,11 +442,24 @@ static uint32_t slot_duration(uint8_t s) {
     return total;
 }
 
+// The Mac layer's Option/Cmd are Keychron keycodes that only process_record turns into
+// real modifiers; playback registers codes directly, so map them here (else e.g. the
+// German Mac '@' = Option+L replays as a bare 'l').
+static uint16_t play_keycode(uint16_t keycode) {
+    switch (keycode) {
+        case KC_LOPTN: return KC_LOPT;
+        case KC_ROPTN: return KC_ROPT;
+        case KC_LCMMD: return KC_LCMD;
+        case KC_RCMMD: return KC_RCMD;
+    }
+    return keycode;
+}
+
 // Not clear_keyboard(): that would also drop keys and mods the user physically holds
 // while a called macro ends (and wipe mousekeys).
 static void release_play_held(void) {
     if (play_held_overflow) clear_keyboard();            // fallback: never leave a key stuck
-    else while (play_nheld) unregister_code16(play_held[--play_nheld]);
+    else while (play_nheld) unregister_code16(play_keycode(play_held[--play_nheld]));
     play_nheld         = 0;
     play_held_overflow = false;
 }
@@ -700,7 +713,7 @@ void matrix_scan_user(void) {
                         called = true;             // its delay is spent on the way back
                     }                              // else: depth cap / empty / recording -> skip
                 } else if (e->flags & EVF_PRESSED) {
-                    register_code16(e->keycode);
+                    register_code16(play_keycode(e->keycode));
                     bool found = false;
                     for (uint8_t h = 0; h < play_nheld; h++) {
                         if (play_held[h] == e->keycode) { found = true; break; }
@@ -710,7 +723,7 @@ void matrix_scan_user(void) {
                         else                                  play_held_overflow = true;
                     }
                 } else {
-                    unregister_code16(e->keycode);
+                    unregister_code16(play_keycode(e->keycode));
                     for (uint8_t h = 0; h < play_nheld; h++) {
                         if (play_held[h] == e->keycode) { play_held[h] = play_held[--play_nheld]; break; }
                     }
