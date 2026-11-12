@@ -127,14 +127,16 @@ static uint8_t  hold_mods        = 0;
 // RAM slots (FN2+Q..P, lost on power-off) and persistent EEPROM slots (FN2+A..Ö).
 //
 // FN2+Tab   : idle -> arm recording (single tap = no delay, double tap = real delays)
-//             triple tap -> configure mode; recording -> stop and save (no keys = erase)
+//             triple tap -> configure mode; recording -> stop and save, then configure
+//             mode with that slot selected (no keys = erase, back to idle)
 //             also the escape hatch out of any state
 // FN2+Q..P  : armed -> record into that RAM slot | idle -> play it
 // FN2+A..Ö  : idle -> play that EEPROM slot (it can't be recorded into, only copied to)
 // any slot  : recording -> play it live (once) AND record a call to it (compose macros)
-//             configure mode -> 1st press selects a slot, 2nd copies it (with its
-//             settings) there; copying an empty slot clears the destination. This is
-//             how EEPROM slots are filled
+//             configure mode -> press selects a slot, pressing it again unselects it;
+//             another slot copies it (with its settings) there and selects the copy.
+//             Copying an empty slot clears the destination. This is how EEPROM slots
+//             are filled
 //             playing -> interrupt
 // FN2+Enter : loop the last played slot, else "repeat last key". Ignored while
 //             armed or recording (a loop records nothing and, since a call is only
@@ -818,6 +820,10 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
             repeat_loop_active = false;
             if (macro_state == ST_RECORDING) {
                 stop_recording();
+                if (slot_len(active_slot) > 0) {   // saved -> configure it right away
+                    cfg_slot    = active_slot;
+                    macro_state = ST_CFG_SEL;
+                }
             } else if (macro_state == ST_ARMED) {
                 if (timer_elapsed32(drec_tap_timer) >= DREC_TAP_TERM) {
                     macro_state = ST_IDLE;         // settled press while armed -> abort
@@ -895,8 +901,11 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
                 cfg_slot    = (uint8_t)slot;
                 macro_state = ST_CFG_SEL;
             } else if (macro_state == ST_CFG_SEL) {
-                copy_slot(cfg_slot, (uint8_t)slot);
-                macro_state = ST_IDLE;
+                if ((uint8_t)slot == cfg_slot) {
+                    macro_state = ST_CFG;          // same slot again -> unselect
+                } else if (copy_slot(cfg_slot, (uint8_t)slot)) {
+                    cfg_slot = (uint8_t)slot;      // copied -> the copy is selected
+                }                                  // no room: nothing changed, keep the source
             } else {                               // ST_IDLE / ST_RECORDING
                 macro_trigger_press((uint8_t)slot);
             }
