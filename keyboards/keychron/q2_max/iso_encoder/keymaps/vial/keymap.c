@@ -127,17 +127,35 @@ static uint8_t  hold_mods        = 0;
 // RAM slots (FN2+Q..P, lost on power-off) and persistent EEPROM slots (FN2+A..Ö).
 //
 // FN2+Tab   : idle -> arm recording (single tap = no delay, double tap = real delays)
-//             triple tap -> copy mode; recording -> stop and save (no keys = erase)
+//             triple tap -> configure mode; recording -> stop and save (no keys = erase)
 //             also the escape hatch out of any state
 // FN2+Q..P  : armed -> record into that RAM slot | idle -> play it
 // FN2+A..Ö  : idle -> play that EEPROM slot (it can't be recorded into, only copied to)
-// any slot  : recording -> play it live AND record a call to it (compose macros)
-//             copy mode -> 1st press picks the source, 2nd the destination; copying
-//             an empty slot clears the destination. This is how EEPROM slots are filled
+// any slot  : recording -> play it live (once) AND record a call to it (compose macros)
+//             configure mode -> 1st press selects a slot, 2nd copies it (with its
+//             settings) there; copying an empty slot clears the destination. This is
+//             how EEPROM slots are filled
 //             playing -> interrupt
 // FN2+Enter : loop the last played slot, else "repeat last key". Ignored while
 //             armed or recording (a loop records nothing and, since a call is only
 //             recorded when nothing plays, would swallow every slot press).
+//
+// Slot settings, edited in configure mode with a non-empty RAM slot selected (EEPROM
+// slots are read-only: copy to RAM, edit, copy back). The mode stays on that slot.
+// FN2+Enter : cycle repeat mode: off (play once) -> hold (loop while held)
+//             -> toggle (loop until pressed again)
+// Stopping a loop (slot press, hold release, FN2+Enter) lets a pass shorter than
+// MACRO_FINISH_MS finish, so no half-typed text; a longer one stops at once.
+// + / -     : (German layout: the keys right of Ü and of '.') no-delay slots only: step
+//             the gap between events through MACRO_GAP_LEVELS (default 2 ms; games often
+//             need ~20 ms+ to see every key), shown as a bar on the number row
+// FN2+Bksp  : capture an alternative trigger. It opens showing the current one; type a
+//             new one (release all keys to retype), Bksp alone empties it, FN2+Bksp
+//             again applies it (empty = remove the trigger). Either one
+//             key with optional modifiers (exact sides: LCtrl != RCtrl), or a chord of
+//             2-4 keys pressed together (QMK combos, see COMBO_TERM). Triggers work idle
+//             and while recording, match keycodes (not positions) and swallow the key;
+//             on a clash RAM slots win over EEPROM ones, then the lower slot.
 //
 // Each bank is one event pool shared by its slots, so a slot is as long as it needs to
 // be. A slot's events are contiguous: freeing a slot compacts the pool, and new content
@@ -156,11 +174,36 @@ typedef struct __attribute__((packed)) {
     uint8_t  flags;     // EVF_*
 } macro_event_t;
 
+// Per-slot settings. An empty slot's settings are all zero.
+#define REP_OFF        0
+#define REP_TOGGLE     1
+#define REP_HOLD       2
+#define TRIG_NONE      0
+#define TRIG_KEY       1   // keys[0] with exactly `mods` held
+#define TRIG_CHORD     2   // keys[] pressed together, sorted, unused entries 0
+#define TRIG_MAX_KEYS  4
+
 typedef struct __attribute__((packed)) {
-    uint16_t off[MACRO_SLOT_COUNT];  // first event in the pool (only valid when len > 0)
-    uint16_t len[MACRO_SLOT_COUNT];
-    uint16_t realdelay;              // bitmask: playback honors real delays?
-    uint16_t used;                   // events in use, all below this index
+    uint8_t mode;                  // bits 0-1: REP_*, bits 2-3: TRIG_*, bits 4-7: gap level
+    uint8_t mods;                  // TRIG_KEY: exact 8-bit modifier mask
+    uint8_t keys[TRIG_MAX_KEYS];   // basic keycodes
+} macro_cfg_t;
+
+#define CFG_REPEAT(c) ((c)->mode & 0x03)
+#define CFG_TRIG(c)   (((c)->mode >> 2) & 0x03)
+#define CFG_GAP(c)    ((c)->mode >> 4)
+
+// No-delay gap per level (ms), one level per number-row LED. Never 0: hosts drop
+// same-poll reports.
+static const uint8_t macro_gap_ms[10] = MACRO_GAP_LEVELS;
+_Static_assert(sizeof(macro_gap_ms) == 10, "MACRO_GAP_LEVELS needs 10 entries");
+
+typedef struct __attribute__((packed)) {
+    uint16_t    off[MACRO_SLOT_COUNT];  // first event in the pool (only valid when len > 0)
+    uint16_t    len[MACRO_SLOT_COUNT];
+    uint16_t    realdelay;              // bitmask: playback honors real delays?
+    uint16_t    used;                   // events in use, all below this index
+    macro_cfg_t cfg[MACRO_SLOT_COUNT];
 } macro_hdr_t;
 
 #define MACRO_TOTAL_SLOTS (2 * MACRO_SLOT_COUNT)  // global index: RAM 0..9, EEPROM 10..19
@@ -191,12 +234,14 @@ static const macro_bank_t macro_banks[2] = {
     {&ee_img.hdr, ee_img.ev, MACRO_EE_EVENTS},
 };
 
-typedef enum { ST_IDLE, ST_ARMED, ST_RECORDING, ST_COPY_SRC, ST_COPY_DST } macro_state_t;
+// ST_CFG: configure mode, nothing selected | ST_CFG_SEL: cfg_slot selected |
+// ST_CFG_CAPTURE: typing cfg_slot's alternative trigger
+typedef enum { ST_IDLE, ST_ARMED, ST_RECORDING, ST_CFG, ST_CFG_SEL, ST_CFG_CAPTURE } macro_state_t;
 
 static macro_state_t  macro_state     = ST_IDLE;
 static bool           armed_realdelay = false;
 static uint8_t        active_slot     = 0;               // RAM slot currently being recorded into
-static uint8_t        copy_src        = 0;               // copy mode: chosen source slot
+static uint8_t        cfg_slot        = 0;               // configure mode: selected slot
 static uint32_t       drec_tap_timer  = 0;               // double/triple-tap detection
 static uint32_t       last_event_time = 0;               // for inter-event delta
 static macro_event_t *last_ev         = NULL;            // event awaiting its delay
@@ -213,6 +258,7 @@ static uint16_t       play_wait       = 0;                // ms to wait before p
 static uint32_t       play_done_ms    = 0;               // macro time of the finished steps
 static uint32_t       play_total_ms   = 0;               // macro time of a full run (progress bar)
 static int8_t         last_macro_slot = -1;              // last slot played (for FN2+Enter loop)
+static int8_t         hold_slot       = -1;              // hold-repeat slot whose trigger is down
 
 // Keys playback registered, so teardown releases exactly those (see release_play_held).
 #define MACRO_PLAY_HELD_MAX 16
@@ -244,6 +290,42 @@ static void set_slot_realdelay(uint8_t s, bool on) {
     uint16_t bit = (uint16_t)1 << slot_local(s);
     if (on) slot_bank(s)->hdr->realdelay |= bit;
     else    slot_bank(s)->hdr->realdelay &= ~bit;
+}
+
+static inline macro_cfg_t *slot_cfg(uint8_t s) { return &slot_bank(s)->hdr->cfg[slot_local(s)]; }
+
+// The fixed wait of a no-delay step (and of a call before its callee runs).
+static inline uint16_t slot_gap(uint8_t s) {
+    uint8_t lv = CFG_GAP(slot_cfg(s));
+    return macro_gap_ms[lv < 10 ? lv : 9];
+}
+
+// Chord triggers as QMK combos, one per slot (combo index == global slot index). The
+// table lives in RAM and is rebuilt whenever a trigger changes; a slot without a chord
+// gets an empty key list, which never matches. KC_NO combos report through
+// process_combo_event(), which plays the slot.
+static uint16_t chord_keys[MACRO_TOTAL_SLOTS][TRIG_MAX_KEYS + 1];  // COMBO_END-terminated
+#define CHORD(i) {.keys = chord_keys[i], .keycode = KC_NO}
+combo_t key_combos[MACRO_TOTAL_SLOTS] = {
+    CHORD(0),  CHORD(1),  CHORD(2),  CHORD(3),  CHORD(4),  CHORD(5),  CHORD(6),
+    CHORD(7),  CHORD(8),  CHORD(9),  CHORD(10), CHORD(11), CHORD(12), CHORD(13),
+    CHORD(14), CHORD(15), CHORD(16), CHORD(17), CHORD(18), CHORD(19),
+};
+_Static_assert(MACRO_TOTAL_SLOTS == 20, "update key_combos[]");
+
+// A chord equal to an earlier slot's (RAM before EEPROM) is left out, so that one wins.
+static void rebuild_chords(void) {
+    for (uint8_t s = 0; s < MACRO_TOTAL_SLOTS; s++) {
+        const macro_cfg_t *c = slot_cfg(s);
+        bool on = CFG_TRIG(c) == TRIG_CHORD;
+        for (uint8_t t = 0; on && t < s; t++) {
+            const macro_cfg_t *o = slot_cfg(t);
+            if (CFG_TRIG(o) == TRIG_CHORD && !memcmp(o->keys, c->keys, TRIG_MAX_KEYS)) on = false;
+        }
+        for (uint8_t i = 0; i < TRIG_MAX_KEYS; i++) chord_keys[s][i] = on ? c->keys[i] : COMBO_END;
+        chord_keys[s][TRIG_MAX_KEYS] = COMBO_END;
+        key_combos[s] = (combo_t)CHORD(s);  // also resets the combo's match state
+    }
 }
 
 // Free a slot's events and close the gap. Offsets of later slots shift down, so
@@ -282,6 +364,7 @@ static void ee_load(void) {
         if (h->len[i] && (uint32_t)h->off[i] + h->len[i] > h->used) ok = false;
     }
     if (!ok) memset(&ee_img, 0, sizeof(ee_img));
+    rebuild_chords();
 }
 
 // Copy src's events to the tail of dst's bank (an empty src clears dst). False = no
@@ -292,7 +375,8 @@ static bool copy_slot(uint8_t src, uint8_t dst) {
     uint8_t             dl = slot_local(dst);
     uint16_t            n  = slot_len(src);
     if ((uint32_t)db->hdr->used - db->hdr->len[dl] + n > db->cap) return false;
-    bool rd = slot_realdelay(src);
+    bool        rd  = slot_realdelay(src);
+    macro_cfg_t cfg = *slot_cfg(src);
     slot_clear(dst);
     if (n) {
         // Resolve src only now: clearing dst may have compacted it (same bank). It sits
@@ -303,7 +387,9 @@ static bool copy_slot(uint8_t src, uint8_t dst) {
         db->hdr->used += n;
     }
     set_slot_realdelay(dst, rd);
+    *slot_cfg(dst) = cfg;
     if (slot_is_ee(dst)) ee_save();
+    rebuild_chords();
     return true;
 }
 
@@ -375,7 +461,11 @@ static void stop_recording(void) {
         e->flags         = 0;
         ram_hdr.len[s]++;
     }
-    if (ram_hdr.len[s] == 0) ram_hdr.off[s] = 0;  // nothing typed -> slot erased
+    if (ram_hdr.len[s] == 0) {                    // nothing typed -> slot erased
+        ram_hdr.off[s] = 0;
+        memset(&ram_hdr.cfg[s], 0, sizeof(macro_cfg_t));
+        rebuild_chords();
+    }
     macro_state = ST_IDLE;
 }
 
@@ -416,7 +506,7 @@ static void start_recording(uint8_t slot) {
 }
 
 // Macro time of one run of a slot, mirroring the waits matrix_scan_user schedules:
-// a key waits w (real delay or MACRO_NODELAY_MS); a call waits MACRO_NODELAY_MS, runs
+// a key waits w (real delay or the slot's gap); a call waits the gap, runs
 // the callee, then waits its own w. Memoized per slot, since calls may fan out; a slot
 // that (indirectly) calls itself counts as 0 there, where playback would run until
 // the stack depth cap.
@@ -431,9 +521,9 @@ static uint32_t slot_duration(uint8_t s) {
     uint32_t total = 0;
     for (uint16_t i = 0; i < slot_len(s); i++) {
         macro_event_t *e = slot_ev(s, i);
-        uint16_t       w = rd ? e->delay_ms : MACRO_NODELAY_MS;
+        uint16_t       w = rd ? e->delay_ms : slot_gap(s);
         if ((e->flags & EVF_CALL) && call_runs((uint8_t)e->keycode)) {
-            total += MACRO_NODELAY_MS + slot_duration((uint8_t)e->keycode);
+            total += slot_gap(s) + slot_duration((uint8_t)e->keycode);
         }
         total += w;
     }
@@ -488,6 +578,13 @@ static void stop_playback(void) {
     if (macro_state == ST_RECORDING) last_event_time = timer_read32();
 }
 
+// End a playback on request: a looping pass shorter than MACRO_FINISH_MS (no-delay
+// macros, short real-delay ones) runs to its end, anything else stops right now.
+static void stop_playback_soft(void) {
+    if (play_depth > 0 && play_loop && play_total_ms < MACRO_FINISH_MS) play_loop = false;
+    else                                                                stop_playback();
+}
+
 static void stop_hold_loop(void) {
     if (hold_keycode != KC_NO) {
         unregister_code16(hold_keycode);
@@ -498,6 +595,205 @@ static void stop_hold_loop(void) {
     hold_loop_active = false;
 }
 
+// A slot was triggered: its key, its alternative trigger, or its chord.
+static void macro_trigger_press(uint8_t s) {
+    stop_hold_loop();
+    if (macro_state == ST_RECORDING) {
+        // Run the slot live *and* record a call to it, once whatever its repeat mode
+        // (a loop can't be recorded). last_macro_slot stays put, so a later FN2+Enter
+        // loops the macro being built.
+        if (play_depth == 0 && call_runs(s)) {
+            record_call(s);                                  // first: it stamps last_event_time
+            start_playback(s, false);
+        }
+        return;
+    }
+    if (play_depth > 0) {
+        if (CFG_REPEAT(slot_cfg(s)) == REP_HOLD && play_root == s && !play_loop) {
+            play_loop = true;                                // re-pressed while its last pass runs
+            hold_slot = s;
+        } else {                                             // press during playback -> interrupt
+            stop_playback_soft();
+            repeat_loop_active = false;
+        }
+        return;
+    }
+    if (slot_len(s) == 0) return;
+    uint8_t rep     = CFG_REPEAT(slot_cfg(s));
+    last_macro_slot = s;
+    start_playback(s, rep != REP_OFF);
+    hold_slot = rep == REP_HOLD ? (int8_t)s : -1;
+}
+
+// Hold repeat: released -> stop the loop.
+static void macro_trigger_release(uint8_t s) {
+    if (hold_slot != (int8_t)s) return;
+    hold_slot = -1;
+    if (play_depth > 0 && play_root == s && play_loop) stop_playback_soft();
+}
+
+void process_combo_event(uint16_t combo_index, bool pressed) {
+    if (combo_index >= MACRO_TOTAL_SLOTS) return;
+    if (pressed) macro_trigger_press((uint8_t)combo_index);
+    else         macro_trigger_release((uint8_t)combo_index);
+}
+
+bool combo_should_trigger(uint16_t combo_index, combo_t *combo, uint16_t keycode, keyrecord_t *record) {
+    if (macro_state != ST_IDLE && macro_state != ST_RECORDING) return false;
+    return combo_index < MACRO_TOTAL_SLOTS && slot_len((uint8_t)combo_index) > 0 &&
+           !call_blocked((uint8_t)combo_index);
+}
+
+// Key triggers (one key + exact modifiers). The trigger's modifiers are lifted from the
+// host while the macro plays (else it would type with Ctrl held), but still count as
+// held for matching, so the trigger can be pressed again with them down. They come
+// back when a modifier key is released or another key is pressed.
+static uint8_t  sup_mods     = 0;      // modifiers lifted by a key trigger, still physically held
+static bool     trig_down    = false;  // a key trigger is held at trig_pos
+static keypos_t trig_pos;
+static uint8_t  trig_slot    = 0;
+
+static int8_t find_key_trigger(uint8_t kc, uint8_t mods) {
+    for (uint8_t s = 0; s < MACRO_TOTAL_SLOTS; s++) {        // RAM first, then EEPROM
+        const macro_cfg_t *c = slot_cfg(s);
+        if (CFG_TRIG(c) == TRIG_KEY && c->keys[0] == kc && c->mods == mods &&
+            slot_len(s) > 0 && !call_blocked(s)) {
+            return (int8_t)s;
+        }
+    }
+    return -1;
+}
+
+// Recorded as modifier key events, so a recording replays what the host saw.
+static void record_mods(uint8_t mods, bool pressed) {
+    for (uint8_t i = 0; i < 8; i++) {
+        if (mods & (1 << i)) record_event(KC_LEFT_CTRL + i, pressed);
+    }
+}
+
+static void restore_sup_mods(void) {
+    if (!sup_mods) return;
+    if (macro_state == ST_RECORDING) record_mods(sup_mods, true);
+    add_mods(sup_mods);
+    sup_mods = 0;
+}
+
+// Trigger capture (ST_CFG_CAPTURE). A press while nothing captured is held starts over.
+#define CAP_MAX 8
+static struct {
+    uint8_t  mods;
+    uint8_t  keys[TRIG_MAX_KEYS];   // non-modifier keys, in press order
+    uint8_t  nkeys;
+    bool     overflow;              // more keys than a trigger can hold
+    keypos_t pos[CAP_MAX];          // every captured key, modifiers too (for the LEDs)
+    uint8_t  npos;
+    keypos_t held[CAP_MAX];         // captured keys still down
+    uint8_t  nheld;
+    uint32_t first, last;           // press times of the first and last non-modifier key
+} cap;
+
+#define CAP_INVALID 0xFF
+
+// TRIG_NONE (nothing typed), TRIG_KEY, TRIG_CHORD or CAP_INVALID.
+static uint8_t cap_kind(void) {
+    if (cap.nkeys == 0 && !cap.mods && !cap.overflow) return TRIG_NONE;
+    if (cap.overflow) return CAP_INVALID;
+    if (cap.nkeys == 1) return TRIG_KEY;
+    if (cap.nkeys >= 2 && !cap.mods && cap.last - cap.first <= COMBO_TERM) return TRIG_CHORD;
+    return CAP_INVALID;                    // modifiers only, modifiers + chord, too slow
+}
+
+static void cap_press(uint8_t kc, keypos_t pos) {
+    if (cap.nheld == 0) memset(&cap, 0, sizeof(cap));
+    if (cap.nheld < CAP_MAX) cap.held[cap.nheld++] = pos;
+    if (cap.npos < CAP_MAX) cap.pos[cap.npos++] = pos;
+    else                    cap.overflow = true;
+    if (IS_MODIFIER_KEYCODE(kc)) {
+        cap.mods |= MOD_BIT(kc);
+        return;
+    }
+    for (uint8_t i = 0; i < cap.nkeys; i++) {
+        if (cap.keys[i] == kc) return;     // same keycode on another key
+    }
+    if (cap.nkeys == TRIG_MAX_KEYS) { cap.overflow = true; return; }
+    uint32_t now = timer_read32();
+    if (cap.nkeys == 0) cap.first = now;
+    cap.last              = now;
+    cap.keys[cap.nkeys++] = (uint8_t)kc;
+}
+
+// False if this key's press wasn't captured (it went to the host before capture began).
+static bool cap_release(keypos_t pos) {
+    for (uint8_t i = 0; i < cap.nheld; i++) {
+        if (KEYEQ(cap.held[i], pos)) {
+            cap.held[i] = cap.held[--cap.nheld];
+            return true;
+        }
+    }
+    return false;
+}
+
+// FN2+Bksp in capture: store the trigger (or remove it). An invalid capture is refused.
+// A key showing `kc` (Mac Option/Cmd as modifiers), searched on the base layer first so
+// the usual key lights, then on the others (e.g. F1 lives on FN2 only).
+static bool find_key_pos(uint8_t kc, keypos_t *out) {
+    uint8_t base = get_highest_layer(default_layer_state);
+    for (uint8_t i = 0; i <= FN2; i++) {
+        uint8_t layer = i == 0 ? base : (i == base ? 0 : i);
+        for (uint8_t r = 0; r < MATRIX_ROWS; r++) {
+            for (uint8_t c = 0; c < MATRIX_COLS; c++) {
+                keypos_t pos = MAKE_KEYPOS(r, c);
+                if (play_keycode(keymap_key_to_keycode(layer, pos)) == kc) {
+                    *out = pos;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// Capture opens on the slot's current trigger, so it can be looked at and kept as is.
+// The timestamps are equal, so a stored chord classifies as a chord again.
+static void cap_load(const macro_cfg_t *c) {
+    memset(&cap, 0, sizeof(cap));
+    uint8_t trig = CFG_TRIG(c);
+    if (trig == TRIG_NONE) return;
+    keypos_t pos;
+    for (uint8_t i = 0; i < 8 && trig == TRIG_KEY; i++) {
+        if (!(c->mods & (1 << i))) continue;
+        cap.mods |= 1 << i;
+        if (cap.npos < CAP_MAX && find_key_pos(KC_LEFT_CTRL + i, &pos)) cap.pos[cap.npos++] = pos;
+    }
+    for (uint8_t i = 0; i < TRIG_MAX_KEYS && c->keys[i]; i++) {
+        cap.keys[cap.nkeys++] = c->keys[i];
+        if (cap.npos < CAP_MAX && find_key_pos(c->keys[i], &pos)) cap.pos[cap.npos++] = pos;
+    }
+}
+
+static void cap_apply(void) {
+    uint8_t kind = cap_kind();
+    if (kind == CAP_INVALID) return;
+    macro_cfg_t *c = slot_cfg(cfg_slot);
+    c->mode        = (c->mode & ~0x0C) | (kind << 2);  // keep repeat mode and gap
+    c->mods        = kind == TRIG_KEY ? cap.mods : 0;
+    memset(c->keys, 0, sizeof(c->keys));
+    for (uint8_t i = 0; i < cap.nkeys && kind != TRIG_NONE; i++) {
+        // chords sorted, so equal chords compare equal (rebuild_chords)
+        uint8_t j = i;
+        while (j > 0 && c->keys[j - 1] > cap.keys[i]) { c->keys[j] = c->keys[j - 1]; j--; }
+        c->keys[j] = cap.keys[i];
+    }
+    memset(&cap, 0, sizeof(cap));
+    rebuild_chords();
+    macro_state = ST_CFG_SEL;
+}
+
+// Settings are editable on non-empty RAM slots only.
+static inline bool cfg_editable(void) {
+    return macro_state == ST_CFG_SEL && !slot_is_ee(cfg_slot) && slot_len(cfg_slot) > 0;
+}
+
 void keyboard_post_init_user(void) {
     ee_load();
 }
@@ -505,13 +801,16 @@ void keyboard_post_init_user(void) {
 // EEPROM reset (also on first boot): the datablock was just zeroed, drop the mirror too.
 void eeconfig_init_user(void) {
     memset(&ee_img, 0, sizeof(ee_img));
+    rebuild_chords();
 }
 
 bool process_record_user(uint16_t keycode, keyrecord_t *record) {
-    int8_t slot = slot_index(keycode);
+    int8_t   slot    = slot_index(keycode);
+    bool     pressed = record->event.pressed;
+    uint16_t kc      = play_keycode(keycode);  // Mac Option/Cmd as real modifiers
 
     if (keycode == DREC) {
-        if (record->event.pressed) {
+        if (pressed) {
             stop_hold_loop();
             if (play_depth > 0) stop_playback();
             // The "repeat last key" loop runs with play_depth == 0 and re-enters
@@ -525,10 +824,10 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
                 } else if (!armed_realdelay) {
                     armed_realdelay = true;        // quick double tap -> measure real delays
                 } else {
-                    macro_state = ST_COPY_SRC;     // quick triple tap -> copy mode
+                    macro_state = ST_CFG;          // quick triple tap -> configure mode
                 }
-            } else if (macro_state == ST_COPY_SRC || macro_state == ST_COPY_DST) {
-                macro_state = ST_IDLE;             // abort copy
+            } else if (macro_state == ST_CFG || macro_state == ST_CFG_SEL || macro_state == ST_CFG_CAPTURE) {
+                macro_state = ST_IDLE;             // leave configure mode
             } else {
                 armed_realdelay = false;           // single tap -> arm (no delay)
                 macro_state     = ST_ARMED;
@@ -538,43 +837,105 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
         return false;
     }
 
-    if (slot >= 0) {
-        if (record->event.pressed) {
-            stop_hold_loop();
-            if (macro_state == ST_RECORDING) {
-                // Run the slot live *and* record a call to it. last_macro_slot stays
-                // put, so a later FN2+Enter loops the macro being built.
-                if (play_depth == 0 && call_runs((uint8_t)slot)) {
-                    record_call((uint8_t)slot);            // first: it stamps last_event_time
-                    start_playback((uint8_t)slot, false);
-                }
-            } else if (play_depth > 0) {           // press during playback -> interrupt
-                stop_playback();
-                repeat_loop_active = false;
-            } else if (macro_state == ST_ARMED) {
-                if (!slot_is_ee((uint8_t)slot)) start_recording((uint8_t)slot);  // EEPROM: copy only
-            } else if (macro_state == ST_COPY_SRC) {
-                copy_src    = (uint8_t)slot;
-                macro_state = ST_COPY_DST;
-            } else if (macro_state == ST_COPY_DST) {
-                copy_slot(copy_src, (uint8_t)slot);
-                macro_state = ST_IDLE;
-            } else if (slot_len((uint8_t)slot) > 0) {  // ST_IDLE
-                last_macro_slot = slot;
-                start_playback((uint8_t)slot, false);
+    // Releases that belong to an earlier key trigger, in any state.
+    if (!pressed && record->event.type == KEY_EVENT) {
+        if (trig_down && KEYEQ(record->event.key, trig_pos)) {
+            trig_down = false;
+            macro_trigger_release(trig_slot);
+            return false;
+        }
+        if (IS_MODIFIER_KEYCODE(kc) && (sup_mods & MOD_BIT(kc))) {
+            sup_mods &= ~MOD_BIT(kc);              // already lifted (and recorded as released)
+            return true;
+        }
+    }
+
+    if (macro_state == ST_CFG_CAPTURE && record->event.type == KEY_EVENT) {
+        if (keycode == HOLD_LOOP) {
+            if (pressed) cap_apply();
+            return false;
+        }
+        if (kc == KC_BSPC) {                       // Bksp: empty the capture (no trigger)
+            if (pressed) memset(&cap, 0, sizeof(cap));
+            return false;
+        }
+        if (IS_QK_MOMENTARY(keycode) || IS_QK_LAYER_TAP(keycode) || IS_QK_TO(keycode) ||
+            IS_QK_TOGGLE_LAYER(keycode) || IS_QK_LAYER_MOD(keycode)) {
+            return true;                           // FN2 must work to reach FN2+Bksp
+        }
+        if (pressed) {
+            if (IS_BASIC_KEYCODE(kc) || IS_MODIFIER_KEYCODE(kc)) cap_press((uint8_t)kc, record->event.key);
+            return false;                          // other keys: ignored
+        }
+        return !cap_release(record->event.key);    // pass releases of keys pressed before
+    }
+
+    // Configure: + / - step the selected no-delay slot's gap. Matched by the key's base
+    // layer keycode, so they also work with FN2 held (+ is a mouse button there).
+    if (macro_state == ST_CFG_SEL && record->event.type == KEY_EVENT) {
+        uint16_t base_kc = keymap_key_to_keycode(get_highest_layer(default_layer_state), record->event.key);
+        if (base_kc == KC_RBRC || base_kc == KC_SLSH) {        // German + / -
+            if (pressed && cfg_editable() && !slot_realdelay(cfg_slot)) {
+                macro_cfg_t *c  = slot_cfg(cfg_slot);
+                uint8_t      lv = CFG_GAP(c);
+                if (base_kc == KC_RBRC && lv < 9) lv++;
+                if (base_kc == KC_SLSH && lv > 0) lv--;
+                c->mode = (c->mode & 0x0F) | (lv << 4);
             }
+            return false;
+        }
+    }
+
+    if (slot >= 0) {
+        if (pressed) {
+            if (macro_state == ST_ARMED) {
+                stop_hold_loop();
+                if (!slot_is_ee((uint8_t)slot)) start_recording((uint8_t)slot);  // EEPROM: copy only
+            } else if (macro_state == ST_CFG) {
+                cfg_slot    = (uint8_t)slot;
+                macro_state = ST_CFG_SEL;
+            } else if (macro_state == ST_CFG_SEL) {
+                copy_slot(cfg_slot, (uint8_t)slot);
+                macro_state = ST_IDLE;
+            } else {                               // ST_IDLE / ST_RECORDING
+                macro_trigger_press((uint8_t)slot);
+            }
+        } else {
+            macro_trigger_release((uint8_t)slot);
         }
         return false;
     }
 
+    // Key triggers: a basic key with exactly the trigger's modifiers.
+    if (pressed && IS_BASIC_KEYCODE(kc) && record->event.type == KEY_EVENT &&
+        (macro_state == ST_IDLE || macro_state == ST_RECORDING)) {
+        int8_t t = find_key_trigger((uint8_t)kc, get_mods() | sup_mods);
+        if (t >= 0) {
+            uint8_t live = get_mods();             // the trigger's mods not yet lifted
+            if (live) {
+                neutralize_flashing_modifiers(live);
+                del_mods(live);
+                send_keyboard_report();
+                if (macro_state == ST_RECORDING) record_mods(live, false);
+                sup_mods |= live;
+            }
+            trig_down = true;
+            trig_pos  = record->event.key;
+            trig_slot = (uint8_t)t;
+            macro_trigger_press((uint8_t)t);
+            return false;
+        }
+        if (play_depth == 0) restore_sup_mods();   // e.g. Ctrl still held, now Ctrl+C
+    }
+
     // A normal key press becomes the new "last action" for FN2+Enter. is_recordable()
     // excludes layer keys, so holding FN2 to reach Enter doesn't reset this.
-    if (record->event.pressed && is_recordable(keycode, record)) {
+    if (pressed && is_recordable(keycode, record)) {
         last_macro_slot = -1;
     }
 
     if (macro_state == ST_RECORDING && is_recordable(keycode, record)) {
-        record_event(keycode, record->event.pressed);
+        record_event(keycode, pressed);
         return true;  // also type the key live
     }
 
@@ -607,6 +968,11 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
             return false;
         case REPEAT_LOOP:
             if (record->event.pressed) {
+                if (cfg_editable()) {                      // configure: cycle repeat mode
+                    macro_cfg_t *c = slot_cfg(cfg_slot);
+                    c->mode        = (c->mode & ~0x03) | ((CFG_REPEAT(c) + 2) % 3);  // off -> hold -> toggle
+                    return false;
+                }
                 if (macro_state != ST_IDLE) return false;  // see the header comment
                 stop_hold_loop();  // mutually exclusive with the hold loop
                 repeat_loop_active = !repeat_loop_active;
@@ -616,12 +982,19 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
                     }
                     // else: "repeat last key" handled in matrix_scan_user
                 } else {
-                    stop_playback();
+                    stop_playback_soft();
                 }
             }
             return false;
         case HOLD_LOOP:
             if (record->event.pressed) {
+                if (macro_state == ST_CFG || macro_state == ST_CFG_SEL) {
+                    if (cfg_editable()) {                  // configure: capture a trigger
+                        cap_load(slot_cfg(cfg_slot));
+                        macro_state = ST_CFG_CAPTURE;
+                    }
+                    return false;
+                }
                 if (hold_loop_active) {
                     stop_hold_loop();
                 } else {
@@ -689,7 +1062,9 @@ void matrix_scan_user(void) {
                         play_stack[0].slot = play_root;
                         play_stack[0].pos  = 0;
                         play_depth         = 1;
-                        play_wait          = MACRO_NODELAY_MS;
+                        // The last event's wait already ran: start over on the next
+                        // scan, so a looped tap is down one gap and up one gap.
+                        play_wait          = 0;
                         play_done_ms       = 0;
                     } else {
                         stop_playback();
@@ -698,7 +1073,7 @@ void matrix_scan_user(void) {
                     // A call's own pause is spent here, after its macro ran.
                     play_frame_t  *pf   = &play_stack[play_depth - 1];
                     macro_event_t *call = slot_ev(pf->slot, pf->pos - 1);
-                    play_wait = slot_realdelay(pf->slot) ? call->delay_ms : MACRO_NODELAY_MS;
+                    play_wait = slot_realdelay(pf->slot) ? call->delay_ms : slot_gap(pf->slot);
                 }
             } else {
                 macro_event_t *e = slot_ev(s, fr->pos);
@@ -728,7 +1103,7 @@ void matrix_scan_user(void) {
                         if (play_held[h] == e->keycode) { play_held[h] = play_held[--play_nheld]; break; }
                     }
                 }
-                play_wait = (called || !slot_realdelay(s)) ? MACRO_NODELAY_MS : e->delay_ms;
+                play_wait = (called || !slot_realdelay(s)) ? slot_gap(s) : e->delay_ms;
             }
             play_timer = timer_read32();
         }
@@ -785,7 +1160,9 @@ void matrix_scan_user(void) {
 
 // LED indices: slot keys by global slot index (Q..P = RAM, A..Ö = EEPROM), and the
 // two 10-key bars (number row 1..0, bottom letter row Y..-).
-#define MACRO_TAB_LED 14
+#define MACRO_TAB_LED   14
+#define MACRO_ENTER_LED 27
+#define MACRO_BSPC_LED  13
 static const uint8_t macro_slot_led[MACRO_TOTAL_SLOTS] = {
     15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
     30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
@@ -794,17 +1171,23 @@ static const uint8_t macro_bar_top[10]    = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
 static const uint8_t macro_bar_bottom[10] = {45, 46, 47, 48, 49, 50, 51, 52, 53, 54};
 
 #define MACRO_C_ACTIVE   0x00, 0xFF, 0x00   // green   — executing slot / active loop toggle
-#define MACRO_C_PARENT   0xFF, 0xFF, 0x00   // yellow  — caller still on the play stack
+#define MACRO_C_PARENT   0xFF, 0x88, 0x00   // orange  — caller still on the play stack
 #define MACRO_C_RECORD   0xFF, 0x00, 0x00   // red     — slot being recorded into
 #define MACRO_C_ARMED_RD 0xFF, 0x00, 0xFF   // magenta — armed, real-delay mode
-#define MACRO_C_ARMED_ND 0xFF, 0xFF, 0x00   // yellow  — armed, no-delay mode
-#define MACRO_C_COPY     0x00, 0x00, 0xFF   // blue    — copy mode (Tab)
-#define MACRO_C_COPY_SRC 0xFF, 0xFF, 0xFF   // white   — chosen copy source
+#define MACRO_C_ARMED_ND 0xFF, 0x88, 0x00   // orange  — armed, no-delay mode
+#define MACRO_C_CFG      0x00, 0x00, 0xFF   // blue    — configure mode (Tab)
+#define MACRO_C_CFG_SEL  0xFF, 0xFF, 0xFF   // white   — selected slot (copy source)
 #define MACRO_C_EMPTY    0x00, 0xFF, 0x00   // green   — selectable empty slot
-#define MACRO_C_USED     0xFF, 0xFF, 0x00   // yellow  — selectable used slot
-#define MACRO_C_LOCKED   0xFF, 0x00, 0x00   // red     — not selectable (EEPROM while armed)
+#define MACRO_C_USED     0xFF, 0x88, 0x00   // orange  — selectable used slot
+#define MACRO_C_OFF      0xFF, 0x00, 0x00   // red     — setting off (Enter: no repeat, Bksp: no trigger)
+#define MACRO_C_ON       0x00, 0xFF, 0x00   // green   — toggle repeat / trigger set / key trigger keys
+#define MACRO_C_HOLD     0xFF, 0x88, 0x00   // orange  — hold repeat
+#define MACRO_C_CAPTURE  0xFF, 0x00, 0xFF   // magenta — capturing a trigger (Bksp)
+#define MACRO_C_CHORD    0xFF, 0x00, 0xFF   // magenta — captured chord keys
+#define MACRO_C_INVALID  0xFF, 0x00, 0x00   // red     — captured keys that can't be a trigger
 #define MACRO_C_PROGRESS 0xFF, 0xFF, 0xFF   // white   — playback progress
 #define MACRO_C_RAM_CAP  0x00, 0xFF, 0xFF   // cyan    — RAM pool fill
+#define MACRO_C_GAP      0xFF, 0xFF, 0xFF   // white   — selected slot's no-delay gap level
 #define MACRO_C_EE_CAP   0xFF, 0x00, 0xFF   // magenta — EEPROM pool fill
 
 // Paint one LED, but only if it falls in the current render window. NO_LED = skip.
@@ -833,22 +1216,54 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
     macro_led(led_min, led_max, repeat_loop_active ? 27 : NO_LED, MACRO_C_ACTIVE);
     macro_led(led_min, led_max, hold_loop_active   ? 13 : NO_LED, MACRO_C_ACTIVE);
 
-    // Slot selection (armed / copy): slot fill state, plus both pools' capacity bars.
-    bool armed   = macro_state == ST_ARMED;
-    bool copying = macro_state == ST_COPY_SRC || macro_state == ST_COPY_DST;
-    if (armed || copying) {
+    // Trigger capture: only the captured keys, colored by what they would become.
+    if (macro_state == ST_CFG_CAPTURE) {
+        macro_led(led_min, led_max, MACRO_TAB_LED, MACRO_C_CFG);
+        macro_led(led_min, led_max, MACRO_BSPC_LED, MACRO_C_CAPTURE);
+        uint8_t kind = cap_kind();
+        for (uint8_t i = 0; i < cap.npos; i++) {
+            uint8_t led = g_led_config.matrix_co[cap.pos[i].row][cap.pos[i].col];
+            if (kind == TRIG_KEY)        macro_led(led_min, led_max, led, MACRO_C_ON);
+            else if (kind == TRIG_CHORD) macro_led(led_min, led_max, led, MACRO_C_CHORD);
+            else                         macro_led(led_min, led_max, led, MACRO_C_INVALID);
+        }
+    }
+
+    // Slot selection (armed / configure): slot fill state, plus both pools' capacity bars.
+    // Armed, the EEPROM slots stay dark: they can't be recorded into.
+    bool armed = macro_state == ST_ARMED;
+    bool cfg   = macro_state == ST_CFG || macro_state == ST_CFG_SEL;
+    if (armed || cfg) {
         if (armed && armed_realdelay) macro_led(led_min, led_max, MACRO_TAB_LED, MACRO_C_ARMED_RD);
         else if (armed)               macro_led(led_min, led_max, MACRO_TAB_LED, MACRO_C_ARMED_ND);
-        else                          macro_led(led_min, led_max, MACRO_TAB_LED, MACRO_C_COPY);
+        else                          macro_led(led_min, led_max, MACRO_TAB_LED, MACRO_C_CFG);
         for (uint8_t s = 0; s < MACRO_TOTAL_SLOTS; s++) {
             uint8_t led = macro_slot_led[s];
-            if (macro_state == ST_COPY_DST && s == copy_src) macro_led(led_min, led_max, led, MACRO_C_COPY_SRC);
-            else if (armed && slot_is_ee(s))                 macro_led(led_min, led_max, led, MACRO_C_LOCKED);
-            else if (slot_len(s) > 0)                        macro_led(led_min, led_max, led, MACRO_C_USED);
-            else                                             macro_led(led_min, led_max, led, MACRO_C_EMPTY);
+            if (macro_state == ST_CFG_SEL && s == cfg_slot) macro_led(led_min, led_max, led, MACRO_C_CFG_SEL);
+            else if (armed && slot_is_ee(s))                continue;
+            else if (slot_len(s) > 0)                       macro_led(led_min, led_max, led, MACRO_C_USED);
+            else                                            macro_led(led_min, led_max, led, MACRO_C_EMPTY);
         }
-        macro_bar(led_min, led_max, macro_bar_top, ram_hdr.used, MACRO_RAM_EVENTS, MACRO_C_RAM_CAP);
+        if (macro_state != ST_CFG_SEL) {   // with a slot selected the number row shows its gap
+            macro_bar(led_min, led_max, macro_bar_top, ram_hdr.used, MACRO_RAM_EVENTS, MACRO_C_RAM_CAP);
+        }
         macro_bar(led_min, led_max, macro_bar_bottom, ee_img.hdr.used, MACRO_EE_EVENTS, MACRO_C_EE_CAP);
+    }
+
+    // Selected slot's settings (read-only for EEPROM slots): Enter = repeat mode,
+    // Bksp = alternative trigger set or not.
+    if (macro_state == ST_CFG_SEL) {
+        const macro_cfg_t *c   = slot_cfg(cfg_slot);
+        uint8_t            rep = CFG_REPEAT(c);
+        if (rep == REP_TOGGLE)    macro_led(led_min, led_max, MACRO_ENTER_LED, MACRO_C_ON);
+        else if (rep == REP_HOLD) macro_led(led_min, led_max, MACRO_ENTER_LED, MACRO_C_HOLD);
+        else                      macro_led(led_min, led_max, MACRO_ENTER_LED, MACRO_C_OFF);
+        if (CFG_TRIG(c) != TRIG_NONE) macro_led(led_min, led_max, MACRO_BSPC_LED, MACRO_C_ON);
+        else                          macro_led(led_min, led_max, MACRO_BSPC_LED, MACRO_C_OFF);
+        // Gap level n lights keys 1..n+1; real-delay slots have no gap, the row stays dark.
+        if (!slot_realdelay(cfg_slot)) {
+            macro_bar(led_min, led_max, macro_bar_top, CFG_GAP(c) + 1, 10, MACRO_C_GAP);
+        }
     }
 
     // Recording: the slot currently being written glows red; the number row shows how
@@ -860,11 +1275,14 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
         }
     }
 
-    // Playing: progress on the number row; the call stack — callers yellow, the
+    // Playing: progress on the number row (only for passes of MACRO_FINISH_MS and up,
+    // shorter ones would just flicker); the call stack — callers orange, the
     // executing (top) slot green. Green is written last so it wins when a slot appears
     // at multiple depths.
     if (play_depth > 0) {
-        macro_bar(led_min, led_max, macro_bar_top, play_elapsed_ms(), play_total_ms, MACRO_C_PROGRESS);
+        if (play_total_ms >= MACRO_FINISH_MS) {
+            macro_bar(led_min, led_max, macro_bar_top, play_elapsed_ms(), play_total_ms, MACRO_C_PROGRESS);
+        }
         for (uint8_t i = 0; i + 1 < play_depth; i++) {
             macro_led(led_min, led_max, macro_slot_led[play_stack[i].slot], MACRO_C_PARENT);
         }
