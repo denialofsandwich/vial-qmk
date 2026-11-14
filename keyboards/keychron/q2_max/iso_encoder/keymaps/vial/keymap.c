@@ -65,6 +65,7 @@ enum persistent_slot_keycodes {
     PSLOT_8,              // FN2+K
     PSLOT_9,              // FN2+L
     PSLOT_10,             // FN2+Ö : persistent macro slot 10
+    CHORD_TOGGLE,         // FN2+Caps: chord triggers on/off (e.g. for games)
 };
 
 // clang-format off
@@ -100,7 +101,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
     [FN2] = LAYOUT_iso_68(
         KC_TILD,  KC_F1,    KC_F2,    KC_F3,    KC_F4,    KC_F5,    KC_F6,    KC_F7,    KC_F8,    KC_F9,    KC_F10,   KC_F11,   KC_F12,   HOLD_LOOP,          _______,
         DREC,     MSLOT_1,  MSLOT_2,  MSLOT_3,  MSLOT_4,  MSLOT_5,  MSLOT_6,  MSLOT_7,  MSLOT_8,  MSLOT_9,  MSLOT_10, MS_BTN4,  MS_BTN1,                      MS_WHLU,
-        _______,  PSLOT_1,  PSLOT_2,  PSLOT_3,  PSLOT_4,  PSLOT_5,  PSLOT_6,  PSLOT_7,  PSLOT_8,  PSLOT_9,  PSLOT_10, MS_BTN5,  MS_BTN2, REPEAT_LOOP,            MS_WHLD,
+        CHORD_TOGGLE, PSLOT_1,  PSLOT_2,  PSLOT_3,  PSLOT_4,  PSLOT_5,  PSLOT_6,  PSLOT_7,  PSLOT_8,  PSLOT_9,  PSLOT_10, MS_BTN5,  MS_BTN2, REPEAT_LOOP,            MS_WHLD,
         _______,  _______,  _______,  _______,  _______,  _______,  BAT_LVL,  _______,  _______,  _______,  _______,  _______,            MS_BTN3,  MS_UP,
         RCTRL_LOOP, _______,  _______,                              _______,                                _______,  _______,  _______,  MS_LEFT,  MS_DOWN,  MS_RGHT)
 };
@@ -151,6 +152,8 @@ static uint8_t  hold_mods        = 0;
 // + / -     : (German layout: the keys right of Ü and of '.') no-delay slots only: step
 //             the gap between events through MACRO_GAP_LEVELS (default 2 ms; games often
 //             need ~20 ms+ to see every key), shown as a bar on the number row
+// FN2+Caps  : chord triggers on/off (Caps red = off; on again after a restart). Off,
+//             chord keys aren't held back, so games get them without the chord delay
 // FN2+Bksp  : capture an alternative trigger. It opens showing the current one; type a
 //             new one (release all keys to retype), Bksp alone empties it, FN2+Bksp
 //             again applies it (empty = remove the trigger). Either one
@@ -416,6 +419,7 @@ static bool is_recordable(uint16_t keycode, keyrecord_t *record) {
         case RCTRL_LOOP:
         case REPEAT_LOOP:
         case HOLD_LOOP:
+        case CHORD_TOGGLE:
             return false;
     }
     // don't record layer-switching keys (e.g. MO(FN2)) — they replay nonsensically
@@ -796,6 +800,70 @@ static inline bool cfg_editable(void) {
     return macro_state == ST_CFG_SEL && !slot_is_ee(cfg_slot) && slot_len(cfg_slot) > 0;
 }
 
+// Chord keys are held back until the chord is ruled out (up to COMBO_TERM). A release
+// before that sends the press and the release back to back, and games that sample the
+// key state once per frame miss such a sub-millisecond tap. So each basic key's release
+// is held back for as long as the key was physically down, minus how long the host
+// already saw it down: the host gets the real hold time, shifted by the chord delay.
+#define HELD_MAX 8
+typedef struct {
+    keypos_t       pos;
+    uint8_t        kc;
+    bool           used;
+    uint16_t       pressed_at;   // physical press (event time)
+    uint16_t       sent_at;      // when the press reached the host
+    deferred_token release;      // pending held-back release, else INVALID_DEFERRED_TOKEN
+} held_key_t;
+static held_key_t held_keys[HELD_MAX];
+
+static held_key_t *held_find(keypos_t pos) {
+    for (uint8_t i = 0; i < HELD_MAX; i++) {
+        if (held_keys[i].used && KEYEQ(held_keys[i].pos, pos)) return &held_keys[i];
+    }
+    return NULL;
+}
+
+// Send a held-back release now (also what is recorded, so recordings keep the hold).
+static void held_send_release(held_key_t *h) {
+    if (h->release != INVALID_DEFERRED_TOKEN) cancel_deferred_exec(h->release);
+    if (macro_state == ST_RECORDING) record_event(h->kc, false);
+    unregister_code(h->kc);
+    h->used = false;
+}
+
+static uint32_t held_release_cb(uint32_t trigger_time, void *arg) {
+    held_key_t *h = (held_key_t *)arg;
+    h->release    = INVALID_DEFERRED_TOKEN;              // fired: nothing left to cancel
+    held_send_release(h);
+    return 0;
+}
+
+static void held_on_press(uint8_t kc, keyrecord_t *record) {
+    held_key_t *h = held_find(record->event.key);
+    if (h) held_send_release(h);                         // re-pressed before its release went out
+    for (uint8_t i = 0; i < HELD_MAX; i++) {
+        if (held_keys[i].used) continue;
+        held_keys[i] = (held_key_t){.pos = record->event.key, .kc = kc, .used = true,
+                                    .pressed_at = record->event.time, .sent_at = timer_read(),
+                                    .release = INVALID_DEFERRED_TOKEN};
+        return;
+    }                                                    // table full: untracked, released as usual
+}
+
+// True if the release was held back (the caller swallows it).
+static bool held_on_release(keyrecord_t *record) {
+    held_key_t *h = held_find(record->event.key);
+    if (!h || h->release != INVALID_DEFERRED_TOKEN) return false;
+    int32_t short_by = (int32_t)TIMER_DIFF_16(record->event.time, h->pressed_at) -
+                       (int32_t)TIMER_DIFF_16(timer_read(), h->sent_at);
+    if (short_by > 0) {
+        h->release = defer_exec((uint32_t)short_by, held_release_cb, h);
+        if (h->release != INVALID_DEFERRED_TOKEN) return true;
+    }
+    h->used = false;                                     // released on time: handled normally
+    return false;
+}
+
 void keyboard_post_init_user(void) {
     ee_load();
 }
@@ -854,6 +922,7 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
             sup_mods &= ~MOD_BIT(kc);              // already lifted (and recorded as released)
             return true;
         }
+        if (held_on_release(record)) return false; // sent later, see held_keys
     }
 
     if (macro_state == ST_CFG_CAPTURE && record->event.type == KEY_EVENT) {
@@ -937,6 +1006,10 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
         if (play_depth == 0) restore_sup_mods();   // e.g. Ctrl still held, now Ctrl+C
     }
 
+    if (pressed && IS_BASIC_KEYCODE(kc) && record->event.type == KEY_EVENT) {
+        held_on_press((uint8_t)kc, record);
+    }
+
     // A normal key press becomes the new "last action" for FN2+Enter. is_recordable()
     // excludes layer keys, so holding FN2 to reach Enter doesn't reset this.
     if (pressed && is_recordable(keycode, record)) {
@@ -969,6 +1042,9 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
             if (record->event.pressed) {
                 SEND_STRING(M0_SEQ);
             }
+            return false;
+        case CHORD_TOGGLE:
+            if (record->event.pressed) combo_toggle();  // off also flushes held-back keys
             return false;
         case RCTRL_LOOP:
             if (record->event.pressed) {
@@ -1034,6 +1110,7 @@ bool remember_last_key_user(uint16_t keycode, keyrecord_t *record, uint8_t *reme
         case RCTRL_LOOP:
         case REPEAT_LOOP:
         case HOLD_LOOP:
+        case CHORD_TOGGLE:
             return false;
     }
     return true;
@@ -1172,6 +1249,7 @@ void matrix_scan_user(void) {
 #define MACRO_TAB_LED   14
 #define MACRO_ENTER_LED 27
 #define MACRO_BSPC_LED  13
+#define MACRO_CAPS_LED  29
 static const uint8_t macro_slot_led[MACRO_TOTAL_SLOTS] = {
     15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
     30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
@@ -1224,6 +1302,7 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
     macro_led(led_min, led_max, rctrl_loop_active  ? 57 : NO_LED, MACRO_C_ACTIVE);
     macro_led(led_min, led_max, repeat_loop_active ? 27 : NO_LED, MACRO_C_ACTIVE);
     macro_led(led_min, led_max, hold_loop_active   ? 13 : NO_LED, MACRO_C_ACTIVE);
+    macro_led(led_min, led_max, is_combo_enabled() ? NO_LED : MACRO_CAPS_LED, MACRO_C_OFF);  // chords off
 
     // Trigger capture: only the captured keys, colored by what they would become.
     if (macro_state == ST_CFG_CAPTURE) {
