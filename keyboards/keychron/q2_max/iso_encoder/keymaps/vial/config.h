@@ -20,11 +20,14 @@
 // Tapped before a key trigger lifts its modifiers, so a lone Alt/GUI tap opens no menu.
 #define DUMMY_MOD_NEUTRALIZER_KEYCODE KC_F18
 
-// Persistent macro bank: header + events in the user EEPROM datablock. The board has
-// 3072 bytes of (wear-leveled) EEPROM; QMK core + Keychron use < 64 of them.
+// Persistent macro bank: header + events in the user EEPROM datablock (~1600 events,
+// like the RAM bank). The board has 8192 bytes of wear-leveled EEPROM (info.json: 16 KB
+// of the last flash sector back it, ~8 KB write log); QMK core + Keychron use < 64 of
+// them. A 64 KB or 128 KB backing hangs the board at boot (cause unknown): keep 16 KB.
+// The EEPROM is mirrored in RAM twice (driver cache + the macro working copy), ~16 KB.
 // Bump the version when the stored layout changes: a mismatch reads back as empty.
-#define EECONFIG_USER_DATA_SIZE    2944
-#define EECONFIG_USER_DATA_VERSION 0x4D430002
+#define EECONFIG_USER_DATA_SIZE    8064
+#define EECONFIG_USER_DATA_VERSION 0x4D430003
 
 #ifdef RGB_MATRIX_ENABLE
 #    define RGB_MATRIX_KEYREACTIVE_ENABLED

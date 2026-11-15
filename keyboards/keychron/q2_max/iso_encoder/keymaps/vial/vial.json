@@ -86,11 +86,6 @@
             "shortName": "Batt"
         },
         {
-            "name": "Custom Macro 0",
-            "title": "Custom Macro (CM0)",
-            "shortName": "CMacro0"
-        },
-        {
             "name": "RCtrl Keep-Alive",
             "title": "Toggle: tap Right Ctrl every 60s",
             "shortName": "RCtrlLp"

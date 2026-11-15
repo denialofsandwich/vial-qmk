@@ -16,7 +16,6 @@
 
 #include QMK_KEYBOARD_H
 #include "keychron_common.h"
-#include "macros/main.h"
 #include "nvm_eeprom_eeconfig_internal.h"  // EECONFIG_SIZE, for the EEPROM budget check
 #ifdef RGB_MATRIX_ENABLE
 #    include "lpm.h"
@@ -35,8 +34,7 @@ enum layers {
 
 // Based in Keychron's QK_KB custom range (NEW_SAFE_RANGE), after Keychron's own keycodes.
 enum custom_keycodes {
-    M0 = NEW_SAFE_RANGE,
-    RCTRL_LOOP,
+    RCTRL_LOOP = NEW_SAFE_RANGE,
     REPEAT_LOOP,
     DREC,        // FN2+Tab: record/stop toggle (single tap = no delay, double tap = real delays)
     MSLOT_1,     // FN2+Q : macro slot 1
@@ -86,7 +84,7 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
 
     [MAC_FN1] = LAYOUT_iso_68(
         KC_NUBS,  KC_BRID,  KC_BRIU,  KC_MCTRL, KC_LNPAD, UG_VALD,  UG_VALU,  KC_MPRV,  KC_MPLY,  KC_MNXT,  KC_MUTE,  KC_VOLD,  KC_VOLU,  _______,            UG_TOGG,
-        _______,  BT_HST1,  BT_HST2,  BT_HST3,  P2P4G,    _______,  _______,  _______,  _______,  _______,  M0,       _______,  _______,                      _______,
+        _______,  BT_HST1,  BT_HST2,  BT_HST3,  P2P4G,    _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,                      _______,
         UG_TOGG,  UG_NEXT,  UG_VALU,  UG_HUEU,  UG_SATU,  UG_SPDU,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,            KC_END,
         _______,  _______,  UG_PREV,  UG_VALD,  UG_HUED,  UG_SATD,  UG_SPDD,  _______,  _______,  _______,  _______,  _______,            _______,  KC_PGUP,
         _______,  _______,  _______,                                _______,                                _______,  _______,  _______,  _______,  KC_PGDN,  _______),
@@ -126,25 +124,30 @@ static uint8_t  hold_mods        = 0;
 // ---------------------------------------------------------------------------
 // Custom multi-slot live macro recorder with two banks of MACRO_SLOT_COUNT slots:
 // RAM slots (FN2+Q..P, lost on power-off) and persistent EEPROM slots (FN2+A..Ö).
+// The EEPROM bank is loaded into a RAM working copy at startup; every change to it
+// (recording, copying, settings) stays in RAM until FN2+Shift in configure mode writes
+// it to flash, so experimenting costs no flash wear. A reboot drops unsaved changes.
 //
 // FN2+Tab   : idle -> arm recording (single tap = no delay, double tap = real delays)
 //             triple tap -> configure mode; recording -> stop and save, then configure
 //             mode with that slot selected (no keys = erase, back to idle)
 //             also the escape hatch out of any state
 // FN2+Q..P  : armed -> record into that RAM slot | idle -> play it
-// FN2+A..Ö  : idle -> play that EEPROM slot (it can't be recorded into, only copied to)
+// FN2+A..Ö  : same for the EEPROM slots (unsaved until FN2+Shift)
 // any slot  : recording -> play it live (once) AND record a call to it (compose macros)
 //             configure mode -> press selects a slot, pressing it again unselects it;
 //             another slot copies it (with its settings) there and selects the copy.
-//             Copying an empty slot clears the destination. This is how EEPROM slots
-//             are filled
+//             Copying an empty slot clears the destination.
 //             playing -> interrupt
+// FN2+Shift : configure mode -> save the EEPROM bank to flash. Slot LEDs (armed and
+//             configure mode): blue = empty, yellow = unsaved (RAM slots, changed EEPROM
+//             slots, also an EEPROM slot emptied since the save), green = saved in flash
 // FN2+Enter : loop the last played slot, else "repeat last key". Ignored while
 //             armed or recording (a loop records nothing and, since a call is only
 //             recorded when nothing plays, would swallow every slot press).
 //
-// Slot settings, edited in configure mode with a non-empty RAM slot selected (EEPROM
-// slots are read-only: copy to RAM, edit, copy back). The mode stays on that slot.
+// Slot settings, edited in configure mode with a non-empty slot selected. The mode
+// stays on that slot.
 // FN2+Enter : cycle repeat mode: off (play once) -> hold (loop while held)
 //             -> toggle (loop until pressed again)
 // Stopping a loop (slot press, hold release, FN2+Enter) lets a pass shorter than
@@ -226,7 +229,8 @@ _Static_assert(MACRO_RAM_EVENTS <= 0xFFFF && MACRO_EE_EVENTS <= 0xFFFF, "macro p
 
 static macro_hdr_t      ram_hdr;
 static macro_event_t    ram_ev[MACRO_RAM_EVENTS];
-static macro_ee_image_t ee_img;
+static macro_ee_image_t ee_img;           // working copy, flash is only written by ee_save()
+static macro_hdr_t      ee_saved_hdr;     // header as last saved, to tell unsaved slots apart
 
 typedef struct {
     macro_hdr_t   *hdr;
@@ -245,7 +249,7 @@ typedef enum { ST_IDLE, ST_ARMED, ST_RECORDING, ST_CFG, ST_CFG_SEL, ST_CFG_CAPTU
 
 static macro_state_t  macro_state     = ST_IDLE;
 static bool           armed_realdelay = false;
-static uint8_t        active_slot     = 0;               // RAM slot currently being recorded into
+static uint8_t        active_slot     = 0;               // slot currently being recorded into
 static uint8_t        cfg_slot        = 0;               // configure mode: selected slot
 static uint32_t       drec_tap_timer  = 0;               // double/triple-tap detection
 static uint32_t       last_event_time = 0;               // for inter-event delta
@@ -351,7 +355,8 @@ static void slot_clear(uint8_t s) {
 }
 
 // In chunks: eeprom_update_block() puts a copy of the whole range on the (2 KB) stack.
-// Unchanged chunks are skipped there, so only what moved gets written.
+// Unchanged chunks are skipped there, so only what moved gets written. Only FN2+Shift
+// in configure mode calls this; every other change stays in the RAM working copy.
 #define MACRO_EE_CHUNK 32
 static void ee_save(void) {
     const uint8_t *img = (const uint8_t *)&ee_img;
@@ -359,6 +364,7 @@ static void ee_save(void) {
     for (uint32_t o = 0; o < n; o += MACRO_EE_CHUNK) {
         eeconfig_update_user_datablock(img + o, o, MIN(n - o, (uint32_t)MACRO_EE_CHUNK));
     }
+    ee_saved_hdr = ee_img.hdr;
 }
 
 static void ee_load(void) {
@@ -369,6 +375,7 @@ static void ee_load(void) {
         if (h->len[i] && (uint32_t)h->off[i] + h->len[i] > h->used) ok = false;
     }
     if (!ok) memset(&ee_img, 0, sizeof(ee_img));
+    ee_saved_hdr = ee_img.hdr;
     rebuild_chords();
 }
 
@@ -393,7 +400,6 @@ static bool copy_slot(uint8_t src, uint8_t dst) {
     }
     set_slot_realdelay(dst, rd);
     *slot_cfg(dst) = cfg;
-    if (slot_is_ee(dst)) ee_save();
     rebuild_chords();
     return true;
 }
@@ -415,7 +421,6 @@ static bool is_recordable(uint16_t keycode, keyrecord_t *record) {
     if (record->event.type != KEY_EVENT) return false;   // skip encoder events
     if (keycode == DREC || slot_index(keycode) >= 0) return false;
     switch (keycode) {
-        case M0:
         case RCTRL_LOOP:
         case REPEAT_LOOP:
         case HOLD_LOOP:
@@ -442,14 +447,17 @@ static void stop_recording(void) {
     if (macro_state != ST_RECORDING) return;
     close_interval();
     last_ev = NULL;
-    uint8_t s = active_slot;
+    uint8_t             s  = active_slot;
+    const macro_bank_t *b  = slot_bank(s);
+    macro_hdr_t        *hd = b->hdr;
+    uint8_t             l  = slot_local(s);
 
     // Release keys still held at stop, so playback never sticks one down. close_interval()
     // above put the pause on the last real event, so a key held until the stop key stays
     // held that long on playback. Appends use the pool space append_event() kept free.
     uint16_t held[MACRO_REC_RESERVE];
     uint8_t  nheld = 0;
-    for (uint16_t i = 0; i < ram_hdr.len[s]; i++) {
+    for (uint16_t i = 0; i < hd->len[l]; i++) {
         macro_event_t *e = slot_ev(s, i);
         if (e->flags & EVF_CALL) continue;
         if (e->flags & EVF_PRESSED) {
@@ -460,16 +468,16 @@ static void stop_recording(void) {
             for (uint8_t h = 0; h < nheld; h++) if (held[h] == e->keycode) { held[h] = held[--nheld]; break; }
         }
     }
-    for (uint8_t h = 0; h < nheld && ram_hdr.used < MACRO_RAM_EVENTS; h++) {
-        macro_event_t *e = &ram_ev[ram_hdr.used++];
-        e->keycode       = held[h];
+    for (uint8_t i = 0; i < nheld && hd->used < b->cap; i++) {
+        macro_event_t *e = &b->ev[hd->used++];
+        e->keycode       = held[i];
         e->delay_ms      = 0;
         e->flags         = 0;
-        ram_hdr.len[s]++;
+        hd->len[l]++;
     }
-    if (ram_hdr.len[s] == 0) {                    // nothing typed -> slot erased
-        ram_hdr.off[s] = 0;
-        memset(&ram_hdr.cfg[s], 0, sizeof(macro_cfg_t));
+    if (hd->len[l] == 0) {                         // nothing typed -> slot erased
+        hd->off[l] = 0;
+        memset(&hd->cfg[l], 0, sizeof(macro_cfg_t));
         rebuild_chords();
     }
     macro_state = ST_IDLE;
@@ -479,9 +487,10 @@ static void stop_recording(void) {
 // pool ends the recording.
 static macro_event_t *append_event(uint8_t flags) {
     close_interval();
-    if (ram_hdr.used + MACRO_REC_RESERVE >= MACRO_RAM_EVENTS) { stop_recording(); return NULL; }
-    macro_event_t *e = &ram_ev[ram_hdr.used++];
-    ram_hdr.len[active_slot]++;
+    const macro_bank_t *b = slot_bank(active_slot);
+    if (b->hdr->used + MACRO_REC_RESERVE >= b->cap) { stop_recording(); return NULL; }
+    macro_event_t *e = &b->ev[b->hdr->used++];
+    b->hdr->len[slot_local(active_slot)]++;
     e->delay_ms      = 0;
     e->flags         = flags;
     last_ev          = e;
@@ -503,7 +512,7 @@ static void record_event(uint16_t keycode, bool pressed) {
 
 static void start_recording(uint8_t slot) {
     slot_clear(slot);
-    ram_hdr.off[slot] = ram_hdr.used;
+    slot_bank(slot)->hdr->off[slot_local(slot)] = slot_bank(slot)->hdr->used;
     set_slot_realdelay(slot, armed_realdelay);
     active_slot     = slot;
     last_ev         = NULL;
@@ -795,9 +804,9 @@ static void cap_apply(void) {
     macro_state = ST_CFG_SEL;
 }
 
-// Settings are editable on non-empty RAM slots only.
+// Settings are editable on non-empty slots.
 static inline bool cfg_editable(void) {
-    return macro_state == ST_CFG_SEL && !slot_is_ee(cfg_slot) && slot_len(cfg_slot) > 0;
+    return macro_state == ST_CFG_SEL && slot_len(cfg_slot) > 0;
 }
 
 // Chord keys are held back until the chord is ruled out (up to COMBO_TERM). A release
@@ -868,9 +877,14 @@ void keyboard_post_init_user(void) {
     ee_load();
 }
 
+// Bootmagic (Esc held on plug-in) still jumps to the bootloader, but keeps the EEPROM:
+// QMK's default wipes it, which would drop the saved macros on every flash.
+void bootmagic_reset_eeprom(void) {}
+
 // EEPROM reset (also on first boot): the datablock was just zeroed, drop the mirror too.
 void eeconfig_init_user(void) {
     memset(&ee_img, 0, sizeof(ee_img));
+    memset(&ee_saved_hdr, 0, sizeof(ee_saved_hdr));
     rebuild_chords();
 }
 
@@ -961,11 +975,22 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
         }
     }
 
+    // Configure: FN2+Shift saves the EEPROM bank to flash. Matched by the base layer
+    // keycode, since right Shift is a mouse button on FN2.
+    if ((macro_state == ST_CFG || macro_state == ST_CFG_SEL) && record->event.type == KEY_EVENT &&
+        IS_LAYER_ON(FN2)) {
+        uint16_t base_kc = keymap_key_to_keycode(get_highest_layer(default_layer_state), record->event.key);
+        if (base_kc == KC_LSFT || base_kc == KC_RSFT) {
+            if (pressed) ee_save();
+            return false;
+        }
+    }
+
     if (slot >= 0) {
         if (pressed) {
             if (macro_state == ST_ARMED) {
                 stop_hold_loop();
-                if (!slot_is_ee((uint8_t)slot)) start_recording((uint8_t)slot);  // EEPROM: copy only
+                start_recording((uint8_t)slot);
             } else if (macro_state == ST_CFG) {
                 cfg_slot    = (uint8_t)slot;
                 macro_state = ST_CFG_SEL;
@@ -1038,11 +1063,6 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
             }
             break;
         }
-        case M0:
-            if (record->event.pressed) {
-                SEND_STRING(M0_SEQ);
-            }
-            return false;
         case CHORD_TOGGLE:
             if (record->event.pressed) combo_toggle();  // off also flushes held-back keys
             return false;
@@ -1106,7 +1126,6 @@ bool remember_last_key_user(uint16_t keycode, keyrecord_t *record, uint8_t *reme
     if (repeat_loop_active || hold_loop_active) return false;
     if (keycode == DREC || slot_index(keycode) >= 0) return false;
     switch (keycode) {
-        case M0:
         case RCTRL_LOOP:
         case REPEAT_LOOP:
         case HOLD_LOOP:
@@ -1264,8 +1283,9 @@ static const uint8_t macro_bar_bottom[10] = {45, 46, 47, 48, 49, 50, 51, 52, 53,
 #define MACRO_C_ARMED_ND 0xFF, 0x88, 0x00   // orange  — armed, no-delay mode
 #define MACRO_C_CFG      0x00, 0x00, 0xFF   // blue    — configure mode (Tab)
 #define MACRO_C_CFG_SEL  0xFF, 0xFF, 0xFF   // white   — selected slot (copy source)
-#define MACRO_C_EMPTY    0x00, 0xFF, 0x00   // green   — selectable empty slot
-#define MACRO_C_USED     0xFF, 0x88, 0x00   // orange  — selectable used slot
+#define MACRO_C_EMPTY    0x00, 0x00, 0xFF   // blue    — empty slot
+#define MACRO_C_UNSAVED  0xFF, 0xCC, 0x00   // yellow  — RAM slot / EEPROM slot not saved as is
+#define MACRO_C_SAVED    0x00, 0xFF, 0x00   // green   — EEPROM slot matching flash
 #define MACRO_C_OFF      0xFF, 0x00, 0x00   // red     — setting off (Enter: no repeat, Bksp: no trigger)
 #define MACRO_C_ON       0x00, 0xFF, 0x00   // green   — toggle repeat / trigger set / key trigger keys
 #define MACRO_C_HOLD     0xFF, 0x88, 0x00   // orange  — hold repeat
@@ -1293,6 +1313,28 @@ static void macro_bar(uint8_t lo, uint8_t hi, const uint8_t leds[10], uint32_t n
     }
 }
 
+// Whether an EEPROM slot differs from what is saved in flash. Offset-independent: a slot
+// only shifted by compaction is unchanged. The datablock is read from the wear-leveling
+// driver's RAM cache, so this touches no flash.
+static bool ee_slot_dirty(uint8_t l) {
+    const macro_hdr_t *h = &ee_img.hdr, *sh = &ee_saved_hdr;
+    uint16_t           len = h->len[l];
+    if (len != sh->len[l]) return true;
+    if (len == 0) return false;
+    if (((h->realdelay ^ sh->realdelay) >> l) & 1) return true;
+    if (memcmp(&h->cfg[l], &sh->cfg[l], sizeof(macro_cfg_t))) return true;
+    const uint8_t *cur = (const uint8_t *)&ee_img.ev[h->off[l]];
+    uint32_t       src = sizeof(macro_hdr_t) + (uint32_t)sh->off[l] * sizeof(macro_event_t);
+    uint32_t       n   = (uint32_t)len * sizeof(macro_event_t);
+    uint8_t        buf[MACRO_EE_CHUNK];
+    for (uint32_t o = 0; o < n; o += MACRO_EE_CHUNK) {
+        uint32_t m = MIN(n - o, (uint32_t)MACRO_EE_CHUNK);
+        eeconfig_read_user_datablock(buf, src + o, m);
+        if (memcmp(buf, cur + o, m)) return true;
+    }
+    return false;
+}
+
 static uint32_t play_elapsed_ms(void) {
     return play_done_ms + MIN(timer_elapsed32(play_timer), (uint32_t)play_wait);
 }
@@ -1317,19 +1359,26 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
         }
     }
 
-    // Slot selection (armed / configure): slot fill state, plus both pools' capacity bars.
-    // Armed, the EEPROM slots stay dark: they can't be recorded into.
+    // Slot selection (armed / configure): slot save state, plus both pools' capacity bars.
     bool armed = macro_state == ST_ARMED;
     bool cfg   = macro_state == ST_CFG || macro_state == ST_CFG_SEL;
     if (armed || cfg) {
+        static uint16_t ee_dirty = 0;      // per EEPROM slot, refreshed once per frame
+        if (led_min == 0) {
+            ee_dirty = 0;
+            for (uint8_t l = 0; l < MACRO_SLOT_COUNT; l++) {
+                if (ee_slot_dirty(l)) ee_dirty |= (uint16_t)1 << l;
+            }
+        }
         if (armed && armed_realdelay) macro_led(led_min, led_max, MACRO_TAB_LED, MACRO_C_ARMED_RD);
         else if (armed)               macro_led(led_min, led_max, MACRO_TAB_LED, MACRO_C_ARMED_ND);
         else                          macro_led(led_min, led_max, MACRO_TAB_LED, MACRO_C_CFG);
         for (uint8_t s = 0; s < MACRO_TOTAL_SLOTS; s++) {
             uint8_t led = macro_slot_led[s];
+            bool dirty = slot_is_ee(s) ? (ee_dirty >> slot_local(s)) & 1 : slot_len(s) > 0;
             if (macro_state == ST_CFG_SEL && s == cfg_slot) macro_led(led_min, led_max, led, MACRO_C_CFG_SEL);
-            else if (armed && slot_is_ee(s))                continue;
-            else if (slot_len(s) > 0)                       macro_led(led_min, led_max, led, MACRO_C_USED);
+            else if (dirty)                                 macro_led(led_min, led_max, led, MACRO_C_UNSAVED);
+            else if (slot_len(s) > 0)                       macro_led(led_min, led_max, led, MACRO_C_SAVED);
             else                                            macro_led(led_min, led_max, led, MACRO_C_EMPTY);
         }
         if (macro_state != ST_CFG_SEL) {   // with a slot selected the number row shows its gap
@@ -1338,7 +1387,7 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
         macro_bar(led_min, led_max, macro_bar_bottom, ee_img.hdr.used, MACRO_EE_EVENTS, MACRO_C_EE_CAP);
     }
 
-    // Selected slot's settings (read-only for EEPROM slots): Enter = repeat mode,
+    // Selected slot's settings: Enter = repeat mode,
     // Bksp = alternative trigger set or not.
     if (macro_state == ST_CFG_SEL) {
         const macro_cfg_t *c   = slot_cfg(cfg_slot);
@@ -1354,11 +1403,14 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
         }
     }
 
-    // Recording: the slot currently being written glows red; the number row shows how
-    // full the RAM pool is (unless a composed call is playing, see below).
+    // Recording: the slot currently being written glows red; its pool's fill shows on
+    // the number row (RAM) or the bottom letter row (EEPROM), the number row only while
+    // no composed call is playing (see below).
     if (macro_state == ST_RECORDING) {
         macro_led(led_min, led_max, macro_slot_led[active_slot], MACRO_C_RECORD);
-        if (play_depth == 0) {
+        if (slot_is_ee(active_slot)) {
+            macro_bar(led_min, led_max, macro_bar_bottom, ee_img.hdr.used, MACRO_EE_EVENTS, MACRO_C_EE_CAP);
+        } else if (play_depth == 0) {
             macro_bar(led_min, led_max, macro_bar_top, ram_hdr.used, MACRO_RAM_EVENTS, MACRO_C_RAM_CAP);
         }
     }
