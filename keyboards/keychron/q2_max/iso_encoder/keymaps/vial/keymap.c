@@ -64,6 +64,9 @@ enum persistent_slot_keycodes {
     PSLOT_9,              // FN2+L
     PSLOT_10,             // FN2+Ö : persistent macro slot 10
     CHORD_TOGGLE,         // FN2+Caps: chord triggers on/off (e.g. for games)
+    MAC_WORDNAV,          // FN1+Backspace (Mac only): Cmd+Left/Right/Bksp -> Option+... on/off
+    BRKT_L,               // FN1+Ö: [ (with Shift: {)
+    BRKT_R,               // FN1+Ä: ] (with Shift: })
 };
 
 // clang-format off
@@ -83,16 +86,16 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
         KC_LCTL,  KC_LGUI,  KC_LALT,                                KC_SPC,                                 KC_RALT,  MO(WIN_FN1),  MO(FN2),  KC_LEFT,  KC_DOWN,  KC_RGHT),
 
     [MAC_FN1] = LAYOUT_iso_68(
-        KC_NUBS,  KC_BRID,  KC_BRIU,  KC_MCTRL, KC_LNPAD, UG_VALD,  UG_VALU,  KC_MPRV,  KC_MPLY,  KC_MNXT,  KC_MUTE,  KC_VOLD,  KC_VOLU,  _______,            UG_TOGG,
+        KC_NUBS,  KC_BRID,  KC_BRIU,  KC_MCTRL, KC_LNPAD, UG_VALD,  UG_VALU,  KC_MPRV,  KC_MPLY,  KC_MNXT,  KC_MUTE,  KC_VOLD,  KC_VOLU,  MAC_WORDNAV,        UG_TOGG,
         _______,  BT_HST1,  BT_HST2,  BT_HST3,  P2P4G,    _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,                      _______,
-        UG_TOGG,  UG_NEXT,  UG_VALU,  UG_HUEU,  UG_SATU,  UG_SPDU,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,            KC_END,
+        UG_TOGG,  UG_NEXT,  UG_VALU,  UG_HUEU,  UG_SATU,  UG_SPDU,  _______,  _______,  _______,  _______,  BRKT_L,   BRKT_R,   _______,  _______,           KC_END,
         _______,  _______,  UG_PREV,  UG_VALD,  UG_HUED,  UG_SATD,  UG_SPDD,  _______,  _______,  _______,  _______,  _______,            _______,  KC_PGUP,
         _______,  _______,  _______,                                _______,                                _______,  _______,  _______,  _______,  KC_PGDN,  _______),
 
     [WIN_FN1] = LAYOUT_iso_68(
         KC_GRV,   KC_BRID,  KC_BRIU,  KC_TASK,  KC_FILE,  UG_VALD,  UG_VALU,  KC_MPRV,  KC_MPLY,  KC_MNXT, KC_MUTE,  KC_VOLD,   KC_VOLU,  KC_PSCR,            UG_TOGG,
         _______,  BT_HST1,  BT_HST2,  BT_HST3,  P2P4G,    _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,                      _______,
-        UG_TOGG,  UG_NEXT,  UG_VALU,  UG_HUEU,  UG_SATU,  UG_SPDU,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,            KC_END,
+        UG_TOGG,  UG_NEXT,  UG_VALU,  UG_HUEU,  UG_SATU,  UG_SPDU,  _______,  _______,  _______,  _______,  BRKT_L,   BRKT_R,   _______,  _______,           KC_END,
         _______,  KC_INT2,  UG_PREV,  UG_VALD,  UG_HUED,  UG_SATD,  UG_SPDD,  _______,  _______,  _______,  _______,  _______,            _______,  KC_PGUP,
         _______,  _______,  _______,                                _______,                                _______,  _______,  _______,  _______,  KC_PGDN,  _______),
 
@@ -115,6 +118,7 @@ const uint16_t PROGMEM encoder_map[][NUM_ENCODERS][2] = {
 #endif // ENCODER_MAP_ENABLE
 
 static bool rctrl_loop_active  = false;
+static bool mac_wordnav_active = false;  // Mac: Cmd+Left/Right/Bksp -> Option+... (FN1+Bksp)
 static bool repeat_loop_active = false;
 
 static bool     hold_loop_active = false;
@@ -425,6 +429,7 @@ static bool is_recordable(uint16_t keycode, keyrecord_t *record) {
         case REPEAT_LOOP:
         case HOLD_LOOP:
         case CHORD_TOGGLE:
+        case MAC_WORDNAV:
             return false;
     }
     // don't record layer-switching keys (e.g. MO(FN2)) — they replay nonsensically
@@ -663,7 +668,7 @@ bool combo_should_trigger(uint16_t combo_index, combo_t *combo, uint16_t keycode
 // host while the macro plays (else it would type with Ctrl held), but still count as
 // held for matching, so the trigger can be pressed again with them down. They come
 // back when a modifier key is released or another key is pressed.
-static uint8_t  sup_mods     = 0;      // modifiers lifted by a key trigger, still physically held
+static uint8_t  sup_mods     = 0;      // modifiers lifted by a key trigger or remap, still held
 static bool     trig_down    = false;  // a key trigger is held at trig_pos
 static keypos_t trig_pos;
 static uint8_t  trig_slot    = 0;
@@ -873,6 +878,78 @@ static bool held_on_release(keyrecord_t *record) {
     return false;
 }
 
+// Keys sent in place of the pressed one (FN1+Ö/Ä brackets, Mac word navigation). The
+// replacement stays registered until its physical key is released, so the host
+// auto-repeats it. Modifiers in the way are lifted like a key trigger's (sup_mods): they
+// come back with the next basic key, so holding them for several presses keeps working.
+#define REMAP_MAX 4
+typedef struct {
+    keypos_t pos;
+    uint16_t code;
+} remap_key_t;
+static remap_key_t remap_keys[REMAP_MAX];
+static uint8_t     remap_n = 0;
+
+static void remap_press(keyrecord_t *record, uint16_t code, uint8_t lift) {
+    lift &= get_mods();                                  // the rest is already in sup_mods
+    if (lift) {
+        neutralize_flashing_modifiers(lift);
+        del_mods(lift);
+        send_keyboard_report();
+        if (macro_state == ST_RECORDING) record_mods(lift, false);
+        sup_mods |= lift;
+    }
+    last_macro_slot = -1;                                // a normal key press for FN2+Enter
+    if (macro_state == ST_RECORDING) record_event(code, true);
+    register_code16(code);
+    if (remap_n < REMAP_MAX) {
+        remap_keys[remap_n++] = (remap_key_t){.pos = record->event.key, .code = code};
+    } else {                                             // table full: a plain tap
+        if (macro_state == ST_RECORDING) record_event(code, false);
+        unregister_code16(code);
+    }
+}
+
+// True if this release belongs to a remapped key (released here, the caller swallows it).
+static bool remap_release(keyrecord_t *record) {
+    for (uint8_t i = 0; i < remap_n; i++) {
+        if (!KEYEQ(remap_keys[i].pos, record->event.key)) continue;
+        if (macro_state == ST_RECORDING) record_event(remap_keys[i].code, false);
+        unregister_code16(remap_keys[i].code);
+        remap_keys[i] = remap_keys[--remap_n];
+        return true;
+    }
+    return false;
+}
+
+// The key a remap sends for this press, or KC_NO to process it normally.
+static uint16_t remap_code(uint16_t keycode, uint8_t mods, uint8_t *lift) {
+    bool mac = get_highest_layer(default_layer_state) == MAC_BASE;
+    switch (keycode) {
+        // FN1+Ö/Ä: [ ] for the German layout (Mac: Option+5/6, Win: AltGr+8/9), with
+        // Shift { } (Mac: Option+8/9, Win: AltGr+7/0).
+        case BRKT_L:
+        case BRKT_R: {
+            bool left  = keycode == BRKT_L;
+            bool shift = mods & MOD_MASK_SHIFT;
+            *lift      = MOD_MASK_SHIFT;
+            if (mac) return LALT(shift ? (left ? KC_8 : KC_9) : (left ? KC_5 : KC_6));
+            return RALT(shift ? (left ? KC_7 : KC_0) : (left ? KC_8 : KC_9));
+        }
+        // Mac Layer only, when toggled on (FN1+Bksp): Remap Ctrl+Left/Right/Backspace to
+        // Alt(option)+Left/Right/Backspace (the Ctrl key sends Cmd on the Mac layer).
+        case KC_LEFT:
+        case KC_RIGHT:
+        case KC_BSPC:
+            if (mac && mac_wordnav_active && (mods & MOD_MASK_GUI) && !(mods & ~MOD_MASK_GUI)) {
+                *lift = MOD_MASK_GUI;
+                return LALT(keycode);
+            }
+            return KC_NO;
+    }
+    return KC_NO;
+}
+
 void keyboard_post_init_user(void) {
     ee_load();
 }
@@ -925,13 +1002,14 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
         return false;
     }
 
-    // Releases that belong to an earlier key trigger, in any state.
+    // Releases that belong to an earlier key trigger or remap, in any state.
     if (!pressed && record->event.type == KEY_EVENT) {
         if (trig_down && KEYEQ(record->event.key, trig_pos)) {
             trig_down = false;
             macro_trigger_release(trig_slot);
             return false;
         }
+        if (remap_release(record)) return false;
         if (IS_MODIFIER_KEYCODE(kc) && (sup_mods & MOD_BIT(kc))) {
             sup_mods &= ~MOD_BIT(kc);              // already lifted (and recorded as released)
             return true;
@@ -1031,6 +1109,15 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
         if (play_depth == 0) restore_sup_mods();   // e.g. Ctrl still held, now Ctrl+C
     }
 
+    if (pressed && record->event.type == KEY_EVENT) {             // see remap_keys
+        uint8_t  lift = 0;
+        uint16_t code = remap_code(keycode, get_mods() | sup_mods, &lift);
+        if (code != KC_NO) {
+            remap_press(record, code, lift);
+            return false;
+        }
+    }
+
     if (pressed && IS_BASIC_KEYCODE(kc) && record->event.type == KEY_EVENT) {
         held_on_press((uint8_t)kc, record);
     }
@@ -1047,24 +1134,11 @@ bool process_record_user(uint16_t keycode, keyrecord_t *record) {
     }
 
     switch (keycode) {
-        // Mac Layer only: Remap Ctrl+Left/Right/Backspace to Alt(option)+Left/Right/Backspace
-        case KC_LEFT:
-        case KC_RIGHT:
-        case KC_BSPC: {
-            if (record->event.pressed && get_highest_layer(default_layer_state) == MAC_BASE) {
-                uint8_t mods      = get_mods();
-                uint8_t ctrl_mods = mods & MOD_MASK_GUI;
-                if (ctrl_mods && !(mods & ~MOD_MASK_GUI)) {
-                    del_mods(ctrl_mods);
-                    tap_code16(LALT(keycode));
-                    add_mods(ctrl_mods);
-                    return false;
-                }
-            }
-            break;
-        }
         case CHORD_TOGGLE:
             if (record->event.pressed) combo_toggle();  // off also flushes held-back keys
+            return false;
+        case MAC_WORDNAV:
+            if (record->event.pressed) mac_wordnav_active = !mac_wordnav_active;
             return false;
         case RCTRL_LOOP:
             if (record->event.pressed) {
@@ -1130,6 +1204,7 @@ bool remember_last_key_user(uint16_t keycode, keyrecord_t *record, uint8_t *reme
         case REPEAT_LOOP:
         case HOLD_LOOP:
         case CHORD_TOGGLE:
+        case MAC_WORDNAV:
             return false;
     }
     return true;
@@ -1345,6 +1420,11 @@ bool rgb_matrix_indicators_advanced_user(uint8_t led_min, uint8_t led_max) {
     macro_led(led_min, led_max, repeat_loop_active ? 27 : NO_LED, MACRO_C_ACTIVE);
     macro_led(led_min, led_max, hold_loop_active   ? 13 : NO_LED, MACRO_C_ACTIVE);
     macro_led(led_min, led_max, is_combo_enabled() ? NO_LED : MACRO_CAPS_LED, MACRO_C_OFF);  // chords off
+    // While FN1 is held on Mac: Bksp shows the Ctrl+Left/Right/Bksp override state.
+    if (IS_LAYER_ON(MAC_FN1)) {
+        if (mac_wordnav_active) macro_led(led_min, led_max, MACRO_BSPC_LED, MACRO_C_ON);
+        else                    macro_led(led_min, led_max, MACRO_BSPC_LED, MACRO_C_OFF);
+    }
 
     // Trigger capture: only the captured keys, colored by what they would become.
     if (macro_state == ST_CFG_CAPTURE) {
